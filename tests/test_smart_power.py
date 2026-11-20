@@ -442,6 +442,41 @@ class TestAdaptiveBrightness(unittest.TestCase):
             (fd_dir / "4").unlink()
             self.assertFalse(ab.is_video_device_busy(str(fake_dev), proc_root=proc_root))
 
+    def test_webcam_warmup_frame_extraction_and_shutter_closed_fallback(self) -> None:
+        # 4 concatenated frames: frames 1..3 dark warmup (0), frame 4 exposed (120)
+        raw = bytes([0] * 100 + [0] * 100 + [5] * 100 + [120] * 100)
+        last = ab.extract_last_raw_frame(raw, frame_count=4)
+        self.assertEqual(len(last), 100)
+        luma, status = ab.analyze_webcam_frame(last)
+        self.assertEqual(status, "ok")
+        self.assertAlmostEqual(luma or 0.0, 120.0, places=2)
+
+        # Closed physical privacy shutter (all pixels 0 or <= 1) must be rejected
+        shutter_luma, shutter_status = ab.analyze_webcam_frame(bytes([0] * 19200))
+        self.assertIsNone(shutter_luma)
+        self.assertEqual(shutter_status, "webcam-shutter-closed")
+
+        shutter_luma_1, shutter_status_1 = ab.analyze_webcam_frame(bytes([1] * 100))
+        self.assertIsNone(shutter_luma_1)
+        self.assertEqual(shutter_status_1, "webcam-shutter-closed")
+
+        # Controller clears cached webcam luma on shutter-closed and falls back to Schedule
+        backend = FakeBacklightBackend(initial_pct=50)
+        als = FakeALSReader(lux=None)
+        ctrl = ab.AdaptiveBrightnessController(backend=backend, als_reader=als)
+        cfg = copy.deepcopy(spc.DEFAULT_CONFIG["brightness"])
+
+        ctrl.ingest_webcam_luma(200.0, status="ok", now=1000.0)
+        tel_cam = ctrl.update(cfg, ac_online=True, now=1001.0, local_hour=12.0)
+        self.assertEqual(tel_cam["brightness_source"], "Webcam")
+
+        ctrl.ingest_webcam_luma(None, status="webcam-shutter-closed", now=2000.0)
+        self.assertIsNone(ctrl.cached_webcam_luma)
+        self.assertIsNone(ctrl.last_ambient_luma)
+        tel_sched = ctrl.update(cfg, ac_online=True, now=2001.0, local_hour=12.0)
+        self.assertEqual(tel_sched["brightness_source"], "Schedule")
+        self.assertEqual(tel_sched["brightness_target_pct"], 78)
+
 
 class TestDisplayRefresh(unittest.TestCase):
     """Tests for kscreen-doctor, wlr-randr, xrandr parsing and mode switching."""
@@ -793,6 +828,78 @@ class TestSmartPowerDaemon(unittest.TestCase):
             self.assertEqual(card, "card1")
             self.assertEqual(audio, dgpu_audio)
             self.assertEqual(vendor, "0x10de")
+
+    def test_rclone_mount_excluded_but_active_transfers_detected(self) -> None:
+        # Persistent background daemons must NOT be in unconditional DOWNLOAD_IMMEDIATE_NAMES
+        self.assertNotIn("rclone", smart_powerd.DOWNLOAD_IMMEDIATE_NAMES)
+        self.assertNotIn("snapd", smart_powerd.DOWNLOAD_IMMEDIATE_NAMES)
+
+        # FUSE mounts and servers are NOT active download triggers
+        self.assertFalse(
+            smart_powerd.is_rclone_download(
+                ["/usr/bin/rclone", "mount", "gdrive:", "/mnt/drive", "--vfs-cache-mode", "writes"]
+            )
+        )
+        self.assertFalse(
+            smart_powerd.is_rclone_download(
+                ["rclone", "--config", "/etc/rclone.conf", "mount", "remote:", "/mnt/r"]
+            )
+        )
+        self.assertFalse(smart_powerd.is_rclone_download(["rclone", "cmount", "remote:", "/mnt/r"]))
+        self.assertFalse(smart_powerd.is_rclone_download(["rclone", "serve", "http", "remote:"]))
+        self.assertFalse(smart_powerd.is_rclone_download(["rclone", "rcd"]))
+        self.assertFalse(smart_powerd.is_rclone_download(["rclone"]))
+
+        # Active transfer subcommands ARE download triggers
+        self.assertTrue(smart_powerd.is_rclone_download(["rclone", "copy", "remote:a", "/tmp/a"]))
+        self.assertTrue(smart_powerd.is_rclone_download(["rclone", "sync", "remote:a", "/tmp/a"]))
+        self.assertTrue(
+            smart_powerd.is_rclone_download(
+                ["rclone", "--transfers", "8", "move", "remote:a", "/tmp/a"]
+            )
+        )
+
+    def test_dynamic_epp_resolution_and_governor_unlock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cdir = Path(tmp) / "cpu0" / "cpufreq"
+            cdir.mkdir(parents=True)
+            gov_path = cdir / "scaling_governor"
+            avail_gov_path = cdir / "scaling_available_governors"
+            epp_path = cdir / "energy_performance_preference"
+            avail_epp_path = cdir / "energy_performance_available_preferences"
+
+            # Simulate amd-pstate-epp starting locked in performance governor
+            gov_path.write_text("performance\n", encoding="utf-8")
+            avail_gov_path.write_text("performance powersave\n", encoding="utf-8")
+            epp_path.write_text("performance\n", encoding="utf-8")
+            avail_epp_path.write_text("performance\n", encoding="utf-8")
+
+            d = self._make_stub_daemon()
+            d.cpufreq_dirs = [cdir]
+            d.epp_paths = [epp_path]
+            d.available_epps = {"performance"}
+            d.available_governors = {"performance", "powersave"}
+
+            # Simulate kernel unlocking full EPP list once scaling_governor becomes powersave
+            orig_detect = d._detect_available_epps
+
+            def dynamic_detect() -> set[str]:
+                if smart_powerd.read_text(gov_path) == "powersave":
+                    avail_epp_path.write_text(
+                        "default performance balance_performance balance_power power\n",
+                        encoding="utf-8",
+                    )
+                return orig_detect()
+
+            d._detect_available_epps = dynamic_detect  # type: ignore[method-assign]
+
+            d._set_cpu_performance("light", "balance_power")
+            self.assertEqual(smart_powerd.read_text(gov_path), "powersave")
+            self.assertEqual(smart_powerd.read_text(epp_path), "balance_power")
+            self.assertIn("balance_power", d.available_epps)
+
+            d._set_cpu_performance("download", "balance_performance")
+            self.assertEqual(smart_powerd.read_text(epp_path), "balance_performance")
 
 
 class TestCrossWorkerContracts(unittest.TestCase):

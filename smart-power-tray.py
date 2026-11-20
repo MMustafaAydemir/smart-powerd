@@ -234,7 +234,7 @@ class WebcamMeasureWorker(QThread):
         self._manual = manual
 
     def run(self) -> None:
-        luma, status = measure_webcam_luma(device=self._device, timeout_sec=4.0)
+        luma, status = measure_webcam_luma(device=self._device, timeout_sec=5.0)
         self.measured.emit(luma, status, self._manual)
 
 
@@ -424,6 +424,8 @@ class SmartPowerTray:
         )
         if status == "webcam-busy":
             self._last_measure_note = "webcam busy"
+        elif status == "webcam-shutter-closed":
+            self._last_measure_note = "shutter closed"
         elif status != "ok" and manual:
             self._last_measure_note = status.replace("-", " ")
         else:

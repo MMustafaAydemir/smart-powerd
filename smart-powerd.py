@@ -203,7 +203,6 @@ DOWNLOAD_IMMEDIATE_NAMES = {
     "rpm-ostree",
     "flatpak",
     "snap",
-    "snapd",
     "pip",
     "pip3",
     "uv",
@@ -217,11 +216,14 @@ DOWNLOAD_IMMEDIATE_NAMES = {
     "curl",
     "axel",
     "rsync",
-    "rclone",
     "jdownloader",
     "fdm",
     "filecxx",
 }
+
+RCLONE_DAEMON_SUBCOMMANDS = frozenset(
+    {"mount", "cmount", "nfsmount", "serve", "rcd"}
+)
 
 # USB interface classes excluded from autosuspend:
 # 03 = HID (keyboard/mouse/touchpad), e0 = Wireless/Bluetooth, 01 = Audio
@@ -299,6 +301,41 @@ def is_electron_ui_helper(args: list[str]) -> bool:
     """Return True if argv belongs to a Chromium/Electron UI helper subprocess."""
     joined = " ".join(args)
     return any(flag in joined for flag in ELECTRON_UI_HELPER_FLAGS)
+
+
+def is_rclone_download(args: list[str]) -> bool:
+    """
+    Return True when rclone is invoked for an active transfer rather than a
+    long-running FUSE mount or server daemon (mount/cmount/nfsmount/serve/rcd).
+    """
+    if len(args) < 2:
+        return False
+    subcmd: str | None = None
+    skip_next = False
+    value_flags = {
+        "--config",
+        "--log-file",
+        "--log-level",
+        "--cache-dir",
+        "--temp-dir",
+        "--password-command",
+        "--bwlimit",
+        "--transfers",
+        "--checkers",
+    }
+    for tok in args[1:10]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("-"):
+            if "=" not in tok and tok in value_flags:
+                skip_next = True
+            continue
+        subcmd = tok.lower()
+        break
+    if not subcmd:
+        return False
+    return subcmd not in RCLONE_DAEMON_SUBCOMMANDS
 
 
 def should_skip_usb_device(dev_cls: str, iface_classes: set[str]) -> bool:
@@ -939,7 +976,13 @@ class SmartPowerDaemon:
             self._set_platform_profile(profile)
 
     def _resolve_supported_epp(self, desired: str) -> str:
-        if not self.available_epps or desired in self.available_epps:
+        # Always re-read live available EPPs: amd-pstate-epp / intel_pstate
+        # dynamically change available preferences when scaling_governor changes.
+        live_epps = self._detect_available_epps()
+        if live_epps:
+            self.available_epps = live_epps
+        available = live_epps or self.available_epps
+        if not available or desired in available:
             return desired
         fallbacks = {
             "balance_power": ("power", "balance_performance", "default"),
@@ -947,7 +990,7 @@ class SmartPowerDaemon:
             "performance": ("balance_performance", "default"),
         }
         for alt in fallbacks.get(desired, ("default",)):
-            if alt in self.available_epps:
+            if alt in available:
                 return alt
         return desired
 
@@ -964,8 +1007,27 @@ class SmartPowerDaemon:
             return None
         return prefs[0]
 
+    def _ensure_epp_compatible_governor(self, desired_epp: str) -> None:
+        """
+        On amd-pstate-epp and active intel_pstate, scaling_governor == 'performance'
+        locks energy_performance_available_preferences to {'performance'} only.
+        Switch to 'powersave' first before writing any non-performance EPP.
+        """
+        if desired_epp == "performance" or not self.cpufreq_dirs:
+            return
+        avail_govs = self._detect_available_governors() or self.available_governors
+        if avail_govs:
+            self.available_governors = avail_govs
+        if "powersave" not in avail_govs:
+            return
+        for cdir in self.cpufreq_dirs:
+            gov_path = cdir / "scaling_governor"
+            if read_text(gov_path) == "performance":
+                write_text(gov_path, "powersave")
+
     def _set_cpu_performance(self, mode: str, desired_epp: str) -> None:
         if self.epp_paths:
+            self._ensure_epp_compatible_governor(desired_epp)
             target = self._resolve_supported_epp(desired_epp)
             for path in self.epp_paths:
                 write_text(path, target)
@@ -978,9 +1040,18 @@ class SmartPowerDaemon:
 
     def _check_cpu_performance(self, mode: str, desired_epp: str) -> None:
         if self.epp_paths:
+            if (
+                desired_epp != "performance"
+                and self.cpufreq_dirs
+                and read_text(self.cpufreq_dirs[0] / "scaling_governor") == "performance"
+            ):
+                avail_govs = self._detect_available_governors() or self.available_governors
+                if "powersave" in avail_govs:
+                    self._set_cpu_performance(mode, desired_epp)
+                    return
             target = self._resolve_supported_epp(desired_epp)
             if read_text(self.epp_paths[0]) != target:
-                self._set_cpu_performance(mode, target)
+                self._set_cpu_performance(mode, desired_epp)
         elif self.cpufreq_dirs:
             gov = self._resolve_fallback_governor(mode)
             if gov and read_text(self.cpufreq_dirs[0] / "scaling_governor") != gov:
@@ -1521,6 +1592,9 @@ class SmartPowerDaemon:
             ):
                 is_dl_proc = True
                 download_reason = download_reason or f"pkg/dl:{exe_name}"
+            elif (comm == "rclone" or exe_name == "rclone") and is_rclone_download(args):
+                is_dl_proc = True
+                download_reason = download_reason or "pkg/dl:rclone"
             elif exe_name in {"docker", "podman"} and any(
                 a in {"pull", "push", "load", "build"} for a in args[1:4]
             ):

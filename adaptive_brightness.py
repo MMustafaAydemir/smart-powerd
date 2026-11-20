@@ -546,17 +546,55 @@ def is_video_device_busy(
     return False
 
 
-def measure_webcam_luma(
-    device: str = "auto",
-    timeout_sec: float = 4.0,
+WEBCAM_WARMUP_FRAMES = 4
+WEBCAM_SHUTTER_MAX_THRESHOLD = 1
+
+
+def extract_last_raw_frame(
+    raw_bytes: bytes,
+    frame_count: int = WEBCAM_WARMUP_FRAMES,
+) -> bytes:
+    """Extract the final raw grayscale frame from ``frame_count`` concatenated frames."""
+    if not raw_bytes or frame_count <= 1:
+        return raw_bytes
+    frame_len = len(raw_bytes) // int(frame_count)
+    if frame_len <= 0:
+        return raw_bytes
+    return raw_bytes[-frame_len:]
+
+
+def analyze_webcam_frame(
+    frame: bytes,
+    shutter_max_threshold: int = WEBCAM_SHUTTER_MAX_THRESHOLD,
 ) -> tuple[float | None, str]:
     """
-    Privacy-safe single-frame ambient luminance probe via ffmpeg in RAM only.
+    Compute mean grayscale luminance (0..255) of a single raw frame.
+
+    Returns ``(None, "webcam-shutter-closed")`` when ``max(frame) <= 1``, which
+    cannot happen on an uncovered CMOS sensor due to read noise and indicates a
+    closed physical privacy shutter (or disabled camera stream).
+    """
+    if not frame:
+        return None, "webcam-capture-failed"
+    if max(frame) <= int(shutter_max_threshold):
+        return None, "webcam-shutter-closed"
+    return sum(frame) / float(len(frame)), "ok"
+
+
+def measure_webcam_luma(
+    device: str = "auto",
+    timeout_sec: float = 5.0,
+    warmup_frames: int = WEBCAM_WARMUP_FRAMES,
+) -> tuple[float | None, str]:
+    """
+    Privacy-safe ambient luminance probe via ffmpeg in RAM only.
 
     - Never writes any image or temporary file to disk.
     - Checks /proc/*/fd first and cleanly skips if another app owns the camera.
-    - Captures 1 tiny grayscale frame to stdout pipe and immediately exits so
-      USB autosuspend puts the webcam back to sleep.
+    - Captures ``warmup_frames`` (default 4) tiny grayscale frames to stdout pipe
+      so UVC auto-exposure settles, inspects only the last frame, rejects closed
+      privacy shutters (``max(frame) <= 1``), and exits immediately so USB
+      autosuspend puts the webcam back to sleep.
     """
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
@@ -569,6 +607,7 @@ def measure_webcam_luma(
     if is_video_device_busy(dev_path):
         return None, "webcam-busy"
 
+    frame_count = max(1, int(warmup_frames))
     attempts = [
         [
             ffmpeg_bin,
@@ -582,7 +621,7 @@ def measure_webcam_luma(
             "-i",
             dev_path,
             "-frames:v",
-            "1",
+            str(frame_count),
             "-pix_fmt",
             "gray",
             "-f",
@@ -599,7 +638,7 @@ def measure_webcam_luma(
             "-i",
             dev_path,
             "-frames:v",
-            "1",
+            str(frame_count),
             "-pix_fmt",
             "gray",
             "-f",
@@ -624,9 +663,8 @@ def measure_webcam_luma(
             return None, "webcam-error"
 
         if proc.returncode == 0 and proc.stdout:
-            frame = proc.stdout
-            mean_luma = sum(frame) / float(len(frame))
-            return mean_luma, "ok"
+            last_frame = extract_last_raw_frame(proc.stdout, frame_count=frame_count)
+            return analyze_webcam_frame(last_frame)
 
     return None, "webcam-capture-failed"
 
@@ -1064,6 +1102,11 @@ class AdaptiveBrightnessController:
             self.last_ambient_luma = round(self.cached_webcam_luma, 1)
             if manual:
                 self._manual_webcam_valid_until = ts + max(60.0, float(manual_ttl_sec))
+        elif status in ("webcam-shutter-closed", "no-webcam"):
+            # Clear stale webcam reading so brightness falls back cleanly to Schedule
+            self.cached_webcam_luma = None
+            self.last_ambient_luma = None
+            self._manual_webcam_valid_until = 0.0
 
     def should_sample_webcam(
         self,
