@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Smart Power Optimize
+Comment=Adaptive Linux laptop power, brightness, and refresh rate tray indicator
+Exec=/usr/local/bin/smart-power-tray
+Icon=battery-good
+Terminal=false
+Categories=System;Utility;
+StartupNotify=false
+X-KDE-autostart-after=panel
+X-GNOME-Autostart-enabled=true

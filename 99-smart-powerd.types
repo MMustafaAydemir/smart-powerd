@@ -1,0 +1,1 @@
+{ "type": "SmartDevPriority", "nice": -5, "ioclass": "best-effort", "ionice": 2, "sched": "normal" }

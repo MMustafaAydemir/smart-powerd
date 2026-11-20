@@ -1,0 +1,21 @@
+[Unit]
+Description=Adaptive Workload-Aware Power Optimization Daemon (smart-powerd)
+After=multi-user.target power-profiles-daemon.service tuned-ppd.service NetworkManager.service ananicy-cpp.service
+Wants=power-profiles-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/smart-powerd
+ExecReload=/usr/local/libexec/smart-powerd-helper reload
+Restart=on-failure
+RestartSec=3
+Nice=5
+RuntimeDirectory=smart-powerd
+RuntimeDirectoryMode=0755
+StateDirectory=smart-powerd
+StateDirectoryMode=0755
+ConfigurationDirectory=smart-powerd
+ConfigurationDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

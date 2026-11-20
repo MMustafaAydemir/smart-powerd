@@ -1,0 +1,14 @@
+# Passwordless control rules for smart-powerd (template using %wheel).
+# install.sh detects local admin groups (%wheel and/or %sudo) and validates
+# the generated /etc/sudoers.d/smart-powerd file with visudo -cf.
+%wheel ALL=(root) NOPASSWD: \
+    /usr/local/libexec/smart-powerd-helper on, \
+    /usr/local/libexec/smart-powerd-helper off, \
+    /usr/local/libexec/smart-powerd-helper toggle, \
+    /usr/local/libexec/smart-powerd-helper reload, \
+    /usr/local/libexec/smart-powerd-helper brightness-on, \
+    /usr/local/libexec/smart-powerd-helper brightness-off, \
+    /usr/local/libexec/smart-powerd-helper brightness-toggle, \
+    /usr/local/libexec/smart-powerd-helper webcam-als-on, \
+    /usr/local/libexec/smart-powerd-helper webcam-als-off, \
+    /usr/local/libexec/smart-powerd-helper webcam-als-toggle

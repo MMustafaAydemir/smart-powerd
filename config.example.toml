@@ -1,0 +1,164 @@
+# ==============================================================================
+# smart-powerd configuration (/etc/smart-powerd/config.toml)
+# ==============================================================================
+# Copy this file to /etc/smart-powerd/config.toml (install.sh does this
+# automatically if the target file does not yet exist).
+#
+# All sections and keys are optional: any omitted value safely falls back to
+# the built-in defaults shown below. Apply changes without restarting via:
+#   smart-powerctl reload
+# ==============================================================================
+
+[general]
+# Daemon polling interval in seconds.
+poll_interval_sec = 2.5
+
+# Seconds to remain in Heavy/Download mode after workload subsides before
+# stepping down to Light mode (prevents mode flapping during bursty builds).
+cooldown_sec = 12.0
+
+# Re-verify Wi-Fi power_save state every N daemon ticks (guards against
+# NetworkManager / kernel resets after resume or roaming).
+wifi_recheck_ticks = 6
+
+
+[cpu]
+# Energy Performance Preference (EPP) used on systems with amd-pstate-epp or
+# intel_pstate active mode. On acpi-cpufreq / passive drivers without EPP,
+# smart-powerd automatically maps modes to scaling_governor instead.
+light_epp_ac = "balance_power"
+light_epp_battery = "balance_power"
+download_epp = "balance_performance"
+heavy_epp = "performance"
+
+# Keep hardware boost/turbo uncapped in Light mode (boost=1 and
+# scaling_max_freq=cpuinfo_max_freq on AMD, no_turbo=0 on Intel) so UI
+# interactions remain instantaneous while idle power stays low.
+uncap_boost_in_light = true
+
+
+[battery_tricks]
+# PCIe Active State Power Management policy in Light mode
+# (e.g. "powersave", "powersupersave", "default"). Restored to baseline in
+# Heavy mode, when disabled, or on uninstall.
+aspm_light = "powersave"
+
+# HD-Audio codec power-save idle timeout in seconds during Light mode
+# (0 disables audio power save). Restored to baseline in Heavy/Off/uninstall.
+audio_power_save_light = 5
+
+# Kernel VM dirty writeback interval (in centiseconds; 1500 = 15s) on
+# Battery + Light mode to reduce disk wakeups. Restored on AC/Heavy/Off.
+dirty_writeback_battery = 1500
+
+# Disable the kernel NMI watchdog (/proc/sys/kernel/nmi_watchdog = 0) in
+# Light mode when writable, eliminating periodic timer interrupts.
+disable_nmi_watchdog = true
+
+# SATA/AHCI Aggressive Link Power Management policy applied to discovered
+# SCSI hosts in Battery + Light mode (e.g. "med_power_with_dipm").
+sata_alpm_light = "med_power_with_dipm"
+
+# AMD Adaptive Backlight Management (ABM) panel power savings level (0..4)
+# applied on Battery + Light mode on supported AMD eDP panels (0 = disabled).
+# Automatically reset to 0 on AC, Heavy mode, or when disabled.
+amd_abm_battery_level = 2
+
+# Enable USB autosuspend for non-HID, non-Bluetooth, non-Audio devices in
+# Light mode (never touches keyboards, mice, headsets, or Bluetooth).
+usb_autosuspend_non_hid = true
+
+# Enable PCI runtime PM ("auto") for dynamically discovered unused Ethernet
+# controllers (only when link is down) and SD card readers in Light mode.
+# Never touches Wi-Fi, NVMe, or active discrete GPUs.
+pci_runtime_pm_unused = true
+
+# Dim discovered keyboard backlight LEDs to 0 on Battery + Light mode and
+# restore the previous brightness level on AC/Heavy/Off.
+kbd_backlight_dim_battery = true
+
+# Automatically switch the built-in laptop panel (eDP/LVDS) to a lower refresh
+# rate on Battery + Light mode, restoring native max refresh on AC/Heavy/Off.
+low_refresh_on_battery_light = true
+
+# Target refresh rate (Hz) when low_refresh_on_battery_light is active.
+# The closest supported mode >= (low_refresh_hz - 1) Hz at current resolution
+# is selected (e.g. 60 Hz on 120/144/165/240/300 Hz panels).
+low_refresh_hz = 60
+
+
+[brightness]
+# Master toggle for adaptive screen brightness (can also be toggled live via
+# tray menu or `smart-powerctl brightness on|off|toggle`).
+enabled = true
+
+# Ambient light source selection:
+#   "auto"     - Hardware IIO/SensorProxy ALS -> optional webcam -> schedule
+#   "als"      - Hardware ambient light sensor only (falls back to schedule)
+#   "webcam"   - Privacy-safe single-frame webcam luma + schedule blend
+#   "schedule" - Circadian time-of-day curve only
+ambient_source = "auto"
+
+# Privacy-safe periodic webcam ambient light sensing fallback (used ONLY when
+# no hardware ALS sensor is present). Captures a single 160x120 grayscale frame
+# purely in RAM only when no other app holds the camera open, then closes the
+# device immediately. Toggle live via tray menu or `smart-powerctl webcam-als off`.
+webcam_als_enabled = true
+
+# V4L2 device path for webcam ambient sensing ("auto" picks first usable device,
+# or specify e.g. "/dev/video0").
+webcam_device = "auto"
+
+# Interval in seconds between periodic webcam ambient samples (default 30 min).
+webcam_interval_sec = 1800
+
+# Brightness multiplier applied while running on battery power (0.1..1.0).
+battery_multiplier = 0.85
+
+# Clamp bounds for automatic brightness adjustments (percentage 1..100).
+min_pct = 12
+max_pct = 95
+
+# Maximum percentage change applied per polling tick for smooth transitions.
+smooth_step_pct = 3
+
+# Seconds to pause automatic adjustments after a manual brightness change
+# (Fn keys or desktop slider) is detected.
+manual_override_pause_sec = 1800
+
+# Circadian time-of-day brightness schedule: list of [hour_0_to_24, percent]
+# control points interpolated smoothly across midnight wrap-around.
+schedule = [
+  [0, 22],
+  [6, 25],
+  [8, 55],
+  [12, 78],
+  [17, 65],
+  [20, 42],
+  [22, 28],
+]
+
+
+[workloads]
+# Additional process names (comm) that should immediately trigger Heavy mode.
+extra_heavy_processes = []
+
+# Additional process names (comm) that should trigger Download mode (disables
+# Wi-Fi power save and lifts CPU EPP for sustained transfers).
+extra_download_processes = []
+
+# Sustained network RX rate (MiB/s) threshold to enter Download mode.
+rx_threshold_mib_s = 1.5
+
+# Immediate network RX spike (MiB/s) threshold to enter Download mode right away.
+rx_immediate_mib_s = 3.0
+
+# Total CPU utilization (%) threshold to trigger Heavy mode.
+cpu_heavy_pct = 25.0
+
+# Single-core CPU utilization (%) threshold to trigger Heavy mode for
+# single-threaded compile/render/game tasks.
+single_core_heavy_pct = 85.0
+
+# Nice priority hint for heavy build/dev processes (matches ananicy-cpp rules).
+heavy_nice = -5
