@@ -957,6 +957,9 @@ class TestSmartPowerDaemon(unittest.TestCase):
             "mid",
         )
 
+    @unittest.skipIf(
+        sys.platform == "win32", "Linux PCI BDF directory names contain ':' illegal on NTFS"
+    )
     def test_discover_dgpu_in_synthetic_sysfs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pci = Path(tmp)

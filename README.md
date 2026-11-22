@@ -133,7 +133,7 @@ Every optimization is toggleable in `config.toml` and restores its captured base
 
 ## GitHub Releases (Pre-Packaged Downloads)
 
-Tagged releases on [GitHub Releases](https://github.com/HuzursuzAdam/smart-powerd/releases) include ready-to-install archives and SHA-256 checksums:
+Tagged releases on [GitHub Releases](https://github.com/MMustafaAydemir/smart-powerd/releases) include ready-to-install archives and SHA-256 checksums:
 
 - `smart-powerd-vX.Y.Z-linux.tar.gz` — complete Linux daemon, tray, CLI, systemd unit, sudoers template, optional `ananicy-cpp` rules, and `install.sh` / `uninstall.sh`
 - `smart-powerd-vX.Y.Z-windows.zip` — complete Windows engine/tray (`windows/smart_power_win.py`), shared Python modules, `requirements-windows.txt`, and PowerShell `install.ps1` / `uninstall.ps1`
@@ -186,7 +186,7 @@ sudo ./install.sh
 
 Or from Git:
 ```bash
-git clone https://github.com/HuzursuzAdam/smart-powerd.git
+git clone https://github.com/MMustafaAydemir/smart-powerd.git
 cd smart-powerd
 sudo ./install.sh
 ```
