@@ -6,7 +6,7 @@ Runs inside the user's graphical session (Wayland or X11) to coordinate:
   - Passwordless Smart Optimize toggle (left-click & right-click menu)
   - Live telemetry tooltip & menu (mode, trigger, battery wattage, EPP, Wi-Fi PS, dGPU)
   - Portable dGPU-safe adaptive brightness & 3-tier ambient light sensing
-  - Multi-DE laptop display refresh rate switching (60 Hz on Battery+Light, native max otherwise)
+  - Multi-DE 3-tier laptop display refresh rate switching (AC max Hz, Battery mid Hz, Low Battery 60 Hz)
   - Per-user QLocalServer IPC + SIGUSR1 handler for `smart-powerctl measure-light`
 """
 
@@ -24,9 +24,10 @@ from typing import Any
 
 _LIB_DIR = Path("/usr/local/lib/smart-power")
 _SCRIPT_DIR = Path(__file__).resolve().parent
-for _path_entry in (str(_SCRIPT_DIR), str(_LIB_DIR)):
-    if _path_entry not in sys.path:
-        sys.path.insert(0, _path_entry)
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+if str(_LIB_DIR) not in sys.path:
+    sys.path.append(str(_LIB_DIR))
 
 from PyQt6.QtCore import QPointF, QProcess, QSocketNotifier, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
@@ -127,7 +128,10 @@ def load_local_config() -> dict[str, Any]:
             pass
     return {
         "battery_tricks": {
-            "low_refresh_on_battery_light": True,
+            "refresh_policy_enabled": True,
+            "ac_refresh_hz": 0,
+            "battery_refresh_hz": 0,
+            "low_battery_refresh_pct": 20,
             "low_refresh_hz": 60,
         },
         "brightness": normalize_brightness_config(None),
@@ -270,7 +274,7 @@ class SmartPowerTray:
         self.act_watt = self._make_info_action("Battery: -- W")
         self.act_cpu = self._make_info_action("CPU EPP: -- | Wi-Fi PS: --")
         self.act_dgpu = self._make_info_action("dGPU: --")
-        self.act_refresh = self._make_info_action("Display: --")
+        self.act_refresh = self._make_info_action("Refresh: --")
         self.act_brightness = self._make_info_action("Brightness: --")
 
         for info_act in (
@@ -531,16 +535,36 @@ class SmartPowerTray:
         return f"{pct}% — {detail}"
 
     @staticmethod
-    def _format_refresh_summary(telemetry: dict[str, Any]) -> str:
+    def _format_refresh_summary(
+        telemetry: dict[str, Any],
+        st: dict[str, Any] | None = None,
+    ) -> str:
         out = telemetry.get("refresh_output")
         cur_hz = telemetry.get("refresh_hz")
-        nat_hz = telemetry.get("native_refresh_hz")
         if not out or cur_hz is None:
             return "Unavailable"
         cur_str = _format_hz(cur_hz)
-        if nat_hz is not None and abs(float(nat_hz) - float(cur_hz)) >= 1.0:
-            return f"{cur_str} / {_format_hz(nat_hz)} ({out})"
-        return f"{cur_str} ({out})"
+
+        if not isinstance(st, dict):
+            return f"{cur_str} ({out})"
+
+        enabled = bool(st.get("enabled", True))
+        if not enabled:
+            return f"{cur_str} (OFF)"
+
+        profile = str(
+            st.get("desired_refresh_profile")
+            or telemetry.get("refresh_profile")
+            or "high"
+        ).strip().lower()
+        if profile == "low":
+            tier_label = "Low Battery"
+        elif profile == "mid":
+            tier_label = "Battery"
+        else:
+            ac_online = SmartPowerTray._is_ac_online(st)
+            tier_label = "AC" if ac_online else "Battery"
+        return f"{cur_str} ({tier_label})"
 
     def _update_ui_and_telemetry(
         self,
@@ -549,10 +573,10 @@ class SmartPowerTray:
         force_write: bool = False,
     ) -> None:
         telemetry = self._publish_display_telemetry(force=force_write)
-        refresh_summary = self._format_refresh_summary(telemetry)
+        refresh_summary = self._format_refresh_summary(telemetry, st)
         bright_summary = self._format_brightness_summary(telemetry, bcfg)
 
-        self.act_refresh.setText(f"Display: {refresh_summary}")
+        self.act_refresh.setText(f"Refresh: {refresh_summary}")
         self.act_brightness.setText(f"Brightness: {bright_summary}")
         self.act_brightness_toggle.setText(
             f"Auto Brightness: {'ON' if bcfg.get('enabled', True) else 'OFF'}"
@@ -568,7 +592,7 @@ class SmartPowerTray:
                 self.last_icon_key = "offline"
             tooltip = (
                 "Smart Power: Daemon offline\n"
-                f"Display: {refresh_summary}\n"
+                f"Refresh: {refresh_summary}\n"
                 f"Brightness: {bright_summary}"
             )
             self.tray.setToolTip(tooltip)
@@ -615,7 +639,7 @@ class SmartPowerTray:
             f"Battery: {bat_line}\n"
             f"CPU EPP: {epp} | Wi-Fi PS: {wifi_ps}\n"
             f"dGPU: {dgpu_line}\n"
-            f"Display: {refresh_summary}\n"
+            f"Refresh: {refresh_summary}\n"
             f"Brightness: {bright_summary}"
         )
         self.tray.setToolTip(tooltip)
@@ -637,20 +661,31 @@ class SmartPowerTray:
         ac_online = self._is_ac_online(st)
         als_lux = st.get("als_lux") if isinstance(st, dict) else None
 
-        # 1. Display refresh rate management
+        # 1. Display refresh rate management (3-tier: high / mid / low)
         if force_probe:
             self.refresh_ctrl.probe(force=True, now=now)
 
+        bt_cfg = self._local_config.get("battery_tricks", {})
         if st:
             desired_refresh = str(st.get("desired_refresh_profile", "high"))
-            low_hz = float(st.get("low_refresh_hz", 60) or 60)
-        else:
-            # Daemon offline: never leave panel forced into low refresh mode
-            desired_refresh = "high"
-            low_hz = float(
-                self._local_config.get("battery_tricks", {}).get("low_refresh_hz", 60) or 60
+            ac_hz = float(st.get("ac_refresh_hz", bt_cfg.get("ac_refresh_hz", 0)) or 0)
+            battery_hz = float(
+                st.get("battery_refresh_hz", bt_cfg.get("battery_refresh_hz", 0)) or 0
             )
-        self.refresh_ctrl.apply_profile(desired_refresh, low_refresh_hz=low_hz, now=now)
+            low_hz = float(st.get("low_refresh_hz", bt_cfg.get("low_refresh_hz", 60)) or 60)
+        else:
+            # Daemon offline: never leave panel forced into stepped-down refresh mode
+            desired_refresh = "high"
+            ac_hz = float(bt_cfg.get("ac_refresh_hz", 0) or 0)
+            battery_hz = float(bt_cfg.get("battery_refresh_hz", 0) or 0)
+            low_hz = float(bt_cfg.get("low_refresh_hz", 60) or 60)
+        self.refresh_ctrl.apply_profile(
+            desired_refresh,
+            ac_hz=ac_hz,
+            battery_hz=battery_hz,
+            low_hz=low_hz,
+            now=now,
+        )
 
         # 2. Adaptive brightness + periodic non-blocking webcam ambient sampling
         if self.brightness_ctrl.should_sample_webcam(bcfg, daemon_als_lux=als_lux, now=now):

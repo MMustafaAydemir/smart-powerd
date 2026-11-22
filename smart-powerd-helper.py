@@ -16,9 +16,10 @@ from pathlib import Path
 
 _LIB_DIR = "/usr/local/lib/smart-power"
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
-for _p in (_LIB_DIR, _SCRIPT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+if _LIB_DIR not in sys.path:
+    sys.path.append(_LIB_DIR)
 
 CONTROL_SOCK = "/run/smart-powerd/control.sock"
 

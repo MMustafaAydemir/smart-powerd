@@ -29,9 +29,10 @@ from typing import Any, Sequence
 
 _LIB_DIR = Path("/usr/local/lib/smart-power")
 _SCRIPT_DIR = Path(__file__).resolve().parent
-for _path_entry in (str(_SCRIPT_DIR), str(_LIB_DIR)):
-    if _path_entry not in sys.path:
-        sys.path.insert(0, _path_entry)
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+if (sys.platform != "win32" or _LIB_DIR.is_dir()) and str(_LIB_DIR) not in sys.path:
+    sys.path.append(str(_LIB_DIR))
 
 try:
     from smart_power_config import DEFAULT_CONFIG as _SHARED_DEFAULT_CONFIG
@@ -455,7 +456,10 @@ def detect_webcam_device(
     """
     Auto-detect the primary visible-light capture V4L2 device (/dev/video*) using
     sysfs metadata only (without opening USB devices unnecessarily).
+    Returns None on Windows (which uses DirectShow instead of V4L2).
     """
+    if sys.platform == "win32":
+        return None
     pref = (preferred or "auto").strip()
     if pref and pref.lower() != "auto":
         dev_path = Path(pref)
@@ -512,7 +516,7 @@ def is_video_device_busy(
     Check /proc/*/fd to verify whether another process currently holds ``device_path``
     open (e.g., Zoom, browser WebRTC, OBS). Returns True if busy.
     """
-    if not device_path or not proc_root.is_dir():
+    if sys.platform == "win32" or not device_path or not proc_root.is_dir():
         return False
 
     own_pid = str(os.getpid())
@@ -570,15 +574,18 @@ def analyze_webcam_frame(
     """
     Compute mean grayscale luminance (0..255) of a single raw frame.
 
-    Returns ``(None, "webcam-shutter-closed")`` when ``max(frame) <= 1``, which
-    cannot happen on an uncovered CMOS sensor due to read noise and indicates a
-    closed physical privacy shutter (or disabled camera stream).
+    Returns ``(None, "webcam-shutter-closed")`` when ``max(frame) <= 1`` (or when
+    mean luma is near-zero ``< 0.5`` with ``max(frame) <= 4``, catching isolated
+    hot pixels/YUV rounding on a covered sensor), which indicates a closed
+    physical privacy shutter or disabled camera stream.
     """
     if not frame:
         return None, "webcam-capture-failed"
-    if max(frame) <= int(shutter_max_threshold):
+    max_val = max(frame)
+    mean_luma = sum(frame) / float(len(frame))
+    if max_val <= int(shutter_max_threshold) or (mean_luma < 0.5 and max_val <= 4):
         return None, "webcam-shutter-closed"
-    return sum(frame) / float(len(frame)), "ok"
+    return mean_luma, "ok"
 
 
 def measure_webcam_luma(

@@ -77,13 +77,28 @@ pci_runtime_pm_unused = true
 # restore the previous brightness level on AC/Heavy/Off.
 kbd_backlight_dim_battery = true
 
-# Automatically switch the built-in laptop panel (eDP/LVDS) to a lower refresh
-# rate on Battery + Light mode, restoring native max refresh on AC/Heavy/Off.
-low_refresh_on_battery_light = true
+# Enable portable 3-tier adaptive refresh rate switching for the built-in
+# laptop panel (AC -> highest native Hz, Battery >= threshold -> mid Hz on
+# 3+ rate panels, Battery < threshold -> low Hz; OFF restores max native Hz).
+# Legacy `low_refresh_on_battery_light` is still honored if present in older configs.
+refresh_policy_enabled = true
 
-# Target refresh rate (Hz) when low_refresh_on_battery_light is active.
-# The closest supported mode >= (low_refresh_hz - 1) Hz at current resolution
-# is selected (e.g. 60 Hz on 120/144/165/240/300 Hz panels).
+# Refresh rate (Hz) while plugged in / charging (0 = auto highest available Hz,
+# e.g. 300 Hz on 300/240/60 or 144 Hz on 144/60; positive int = explicit target).
+ac_refresh_hz = 0
+
+# Refresh rate (Hz) on battery at or above low_battery_refresh_pct
+# (0 = auto step-down to second-highest Hz > low_refresh_hz when 3+ rates exist,
+# e.g. 240 Hz on 300/240/60 or 120 Hz on 165/120/60; stays at max on 2-rate
+# panels like 144/60; positive int = explicit target).
+battery_refresh_hz = 0
+
+# Battery percentage below which the panel drops to low_refresh_hz while
+# unplugged (+2% hysteresis to exit on battery; exits immediately on AC).
+low_battery_refresh_pct = 20
+
+# Target refresh rate (Hz) when unplugged below low_battery_refresh_pct.
+# Selects the closest supported mode (preferring >= 59 Hz) at current resolution.
 low_refresh_hz = 60
 
 

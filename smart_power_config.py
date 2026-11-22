@@ -53,7 +53,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "usb_autosuspend_non_hid": True,
         "pci_runtime_pm_unused": True,
         "kbd_backlight_dim_battery": True,
-        "low_refresh_on_battery_light": True,
+        "refresh_policy_enabled": True,
+        "ac_refresh_hz": 0,
+        "battery_refresh_hz": 0,
+        "low_battery_refresh_pct": 20,
         "low_refresh_hz": 60,
     },
     "brightness": {
@@ -133,7 +136,21 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return defaults
 
-    return deep_merge(defaults, parsed)
+    merged = deep_merge(defaults, parsed)
+
+    # Backward compatibility: honor legacy `low_refresh_on_battery_light` when
+    # an existing v2.0 config.toml sets it without setting `refresh_policy_enabled`.
+    raw_bt = parsed.get("battery_tricks")
+    if (
+        isinstance(raw_bt, dict)
+        and "low_refresh_on_battery_light" in raw_bt
+        and "refresh_policy_enabled" not in raw_bt
+    ):
+        merged["battery_tricks"]["refresh_policy_enabled"] = bool(
+            raw_bt["low_refresh_on_battery_light"]
+        )
+
+    return merged
 
 
 def effective_brightness_config(

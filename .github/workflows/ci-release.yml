@@ -1,0 +1,97 @@
+name: CI & Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax-check shell scripts (Linux)
+        if: runner.os == 'Linux'
+        run: bash -n install.sh uninstall.sh scripts/build-release.sh
+
+      - name: Byte-compile all Python sources
+        run: |
+          python -c "import pathlib, py_compile; files = sorted(p for p in pathlib.Path('.').rglob('*.py') if '.git' not in p.parts); [py_compile.compile(str(p), doraise=True) for p in files]; print(f'Compiled {len(files)} Python files OK')"
+
+      - name: Validate config.example.toml matches DEFAULT_CONFIG
+        run: |
+          python -c "import tomllib, smart_power_config; parsed = tomllib.load(open('config.example.toml', 'rb')); assert parsed == smart_power_config.DEFAULT_CONFIG, f'Config drift:\n{parsed}\nvs\n{smart_power_config.DEFAULT_CONFIG}'; print('config.example.toml == DEFAULT_CONFIG: OK')"
+
+      - name: Run unit & contract tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Dry-run release archive build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x scripts/build-release.sh
+          ./scripts/build-release.sh v0.0.0-ci
+          cd dist
+          sha256sum -c SHA256SUMS.txt
+
+  release:
+    name: Build & Publish GitHub Release
+    needs: [test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build release artifacts
+        run: |
+          chmod +x scripts/build-release.sh
+          ./scripts/build-release.sh "${GITHUB_REF_NAME}"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ASSETS=(
+            "dist/smart-powerd-${TAG}-linux.tar.gz"
+            "dist/smart-powerd-${TAG}-windows.zip"
+            "dist/SHA256SUMS.txt"
+          )
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+          else
+            gh release create "${TAG}" "${ASSETS[@]}" \
+              --title "smart-powerd ${TAG}" \
+              --generate-notes
+          fi

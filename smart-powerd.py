@@ -26,9 +26,10 @@ from typing import Any
 
 _LIB_DIR = "/usr/local/lib/smart-power"
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
-for _p in (_LIB_DIR, _SCRIPT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+if _LIB_DIR not in sys.path:
+    sys.path.append(_LIB_DIR)
 
 from smart_power_config import (  # noqa: E402
     DEFAULT_CONFIG_PATH,
@@ -368,16 +369,60 @@ def compute_battery_watts(
     return 0.0
 
 
+LOW_BATTERY_HYSTERESIS_PCT = 2
+
+
 def compute_desired_refresh_profile(
     enabled: bool,
-    mode: str,
     ac_online: bool,
-    low_refresh_on_battery_light: bool,
+    battery_pct: int | float | None = 100,
+    refresh_policy_enabled: bool = True,
+    low_battery_refresh_pct: int = 20,
+    previous_profile: str | None = None,
+    battery_present: bool = True,
+    hysteresis_pct: int = LOW_BATTERY_HYSTERESIS_PCT,
 ) -> str:
-    """Return 'low' only when enabled, in Light Mode, on battery, and configured."""
-    if enabled and mode == "light" and not ac_online and low_refresh_on_battery_light:
+    """
+    Compute the 3-tier refresh profile ('high' | 'mid' | 'low'):
+      - Smart Optimize OFF or refresh policy disabled -> 'high'
+      - AC online or no battery present -> 'high' (exits 'low' immediately)
+      - Unplugged & battery_pct < low_battery_refresh_pct -> 'low'
+      - Unplugged & previous_profile == 'low' & battery_pct < threshold + hysteresis -> 'low'
+      - Otherwise on battery -> 'mid'
+    """
+    if not enabled or not refresh_policy_enabled:
+        return "high"
+    if ac_online or not battery_present:
+        return "high"
+
+    try:
+        threshold = max(0, min(100, int(low_battery_refresh_pct)))
+    except (TypeError, ValueError):
+        threshold = 20
+
+    if threshold <= 0:
+        return "mid"
+
+    if battery_pct is None:
+        return "low" if previous_profile == "low" else "mid"
+
+    try:
+        pct = float(battery_pct)
+    except (TypeError, ValueError):
+        return "low" if previous_profile == "low" else "mid"
+
+    if pct < threshold:
         return "low"
-    return "high"
+
+    try:
+        hyst = max(0, int(hysteresis_pct))
+    except (TypeError, ValueError):
+        hyst = LOW_BATTERY_HYSTERESIS_PCT
+
+    if previous_profile == "low" and pct < (threshold + hyst):
+        return "low"
+
+    return "mid"
 
 
 def discover_dgpu_in(
@@ -578,6 +623,7 @@ class SmartPowerDaemon:
         self.current_mode: str | None = None
         self.current_reason = "initializing"
         self.last_ac_online: bool | None = None
+        self.last_refresh_profile: str = "high"
         self.last_mode_activity_ts: dict[str, float] = {}
         self.inhibit_fd: int | None = None
         self.last_wifi_ps: str | None = None
@@ -1772,18 +1818,41 @@ class SmartPowerDaemon:
 
         effective_mode = self.current_mode or ("light" if self.enabled else "off")
         tricks_cfg = self.config.get("battery_tricks", {})
-        low_refresh_enabled = bool(tricks_cfg.get("low_refresh_on_battery_light", True))
+        if "refresh_policy_enabled" in tricks_cfg:
+            refresh_policy_enabled = bool(tricks_cfg["refresh_policy_enabled"])
+        else:
+            refresh_policy_enabled = bool(
+                tricks_cfg.get("low_refresh_on_battery_light", True)
+            )
         try:
-            low_refresh_hz = int(tricks_cfg.get("low_refresh_hz", 60))
+            ac_refresh_hz = max(0, int(tricks_cfg.get("ac_refresh_hz", 0)))
+        except (TypeError, ValueError):
+            ac_refresh_hz = 0
+        try:
+            battery_refresh_hz = max(0, int(tricks_cfg.get("battery_refresh_hz", 0)))
+        except (TypeError, ValueError):
+            battery_refresh_hz = 0
+        try:
+            low_battery_refresh_pct = max(
+                0, min(100, int(tricks_cfg.get("low_battery_refresh_pct", 20)))
+            )
+        except (TypeError, ValueError):
+            low_battery_refresh_pct = 20
+        try:
+            low_refresh_hz = max(30, int(tricks_cfg.get("low_refresh_hz", 60)))
         except (TypeError, ValueError):
             low_refresh_hz = 60
 
         desired_refresh = compute_desired_refresh_profile(
             enabled=self.enabled,
-            mode=effective_mode,
             ac_online=bool(bat_info["ac_online"]),
-            low_refresh_on_battery_light=low_refresh_enabled,
+            battery_pct=bat_info.get("battery_pct", 100),
+            refresh_policy_enabled=refresh_policy_enabled,
+            low_battery_refresh_pct=low_battery_refresh_pct,
+            previous_profile=self.last_refresh_profile,
+            battery_present=bool(bat_info.get("battery_present", True)),
         )
+        self.last_refresh_profile = desired_refresh
 
         platform_profile = read_text(PLATFORM_PROFILE_PATH) or "none"
 
@@ -1804,6 +1873,9 @@ class SmartPowerDaemon:
             "charge_thresholds": self._read_charge_thresholds(),
             "als_lux": discover_als_lux(),
             "desired_refresh_profile": desired_refresh,
+            "ac_refresh_hz": ac_refresh_hz,
+            "battery_refresh_hz": battery_refresh_hz,
+            "low_battery_refresh_pct": low_battery_refresh_pct,
             "low_refresh_hz": low_refresh_hz,
             "brightness_config": effective_brightness_config(self.config, self.state),
             "wifi_iface": self.wifi_iface or "none",

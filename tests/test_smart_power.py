@@ -176,6 +176,25 @@ extra_heavy_processes = ["my_solver", "sim_runner"]
             parsed = tomllib.load(fh)
         self.assertEqual(parsed, spc.DEFAULT_CONFIG)
 
+    def test_legacy_low_refresh_on_battery_light_migrates_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy_cfg = Path(tmp) / "legacy.toml"
+            legacy_cfg.write_text(
+                "[battery_tricks]\nlow_refresh_on_battery_light = false\n",
+                encoding="utf-8",
+            )
+            loaded = spc.load_config(legacy_cfg)
+            self.assertFalse(loaded["battery_tricks"]["refresh_policy_enabled"])
+
+            # Explicit refresh_policy_enabled takes precedence over legacy key
+            mixed_cfg = Path(tmp) / "mixed.toml"
+            mixed_cfg.write_text(
+                "[battery_tricks]\nlow_refresh_on_battery_light = false\nrefresh_policy_enabled = true\n",
+                encoding="utf-8",
+            )
+            loaded_mixed = spc.load_config(mixed_cfg)
+            self.assertTrue(loaded_mixed["battery_tricks"]["refresh_policy_enabled"])
+
 
 class TestAdaptiveBrightness(unittest.TestCase):
     """Tests for circadian schedule, ambient mapping, clamping, override, and safe backlight."""
@@ -426,6 +445,7 @@ class TestAdaptiveBrightness(unittest.TestCase):
         self.assertIsNotNone(dict_pick)
         self.assertEqual(dict_pick["name"], "intel_backlight")
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX /proc/<pid>/fd symlink check")
     def test_is_video_device_busy_detects_open_fd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             proc_root = Path(tmp) / "proc"
@@ -459,6 +479,12 @@ class TestAdaptiveBrightness(unittest.TestCase):
         shutter_luma_1, shutter_status_1 = ab.analyze_webcam_frame(bytes([1] * 100))
         self.assertIsNone(shutter_luma_1)
         self.assertEqual(shutter_status_1, "webcam-shutter-closed")
+
+        # Isolated hot-pixel noise on a closed shutter (mean < 0.5, max <= 4) also rejected
+        hot_pixel_frame = bytes([0] * 999 + [3])
+        hp_luma, hp_status = ab.analyze_webcam_frame(hot_pixel_frame)
+        self.assertIsNone(hp_luma)
+        self.assertEqual(hp_status, "webcam-shutter-closed")
 
         # Controller clears cached webcam luma on shutter-closed and falls back to Schedule
         backend = FakeBacklightBackend(initial_pct=50)
@@ -533,24 +559,86 @@ DP-1 disconnected (normal left inverted right x axis y axis)
         self.assertEqual((info.current_mode.width, info.current_mode.height), (2560, 1600))
         self.assertAlmostEqual(info.current_mode.refresh_hz, 300.0, places=2)
 
-        low_mode, high_mode = dr.choose_refresh_modes(info, low_refresh_hz=60.0)
-        self.assertIsNotNone(low_mode)
-        self.assertIsNotNone(high_mode)
-        assert low_mode is not None and high_mode is not None
+        tiers = dr.choose_refresh_modes(info, ac_hz=0, battery_hz=0, low_hz=60.0)
+        high_mode, mid_mode, low_mode = tiers["high"], tiers["mid"], tiers["low"]
+        assert high_mode is not None and mid_mode is not None and low_mode is not None
+        self.assertEqual(high_mode.mode_id, "1")
+        self.assertAlmostEqual(high_mode.refresh_hz, 300.0, places=2)
+        self.assertEqual(mid_mode.mode_id, "2")
+        self.assertAlmostEqual(mid_mode.refresh_hz, 240.0, places=2)
         self.assertEqual(low_mode.mode_id, "3")
         self.assertAlmostEqual(low_mode.refresh_hz, 60.0, places=2)
         self.assertEqual((low_mode.width, low_mode.height), (2560, 1600))
-        self.assertEqual(high_mode.mode_id, "1")
-        self.assertAlmostEqual(high_mode.refresh_hz, 300.0, places=2)
 
-        target_low = dr.select_target_mode(info, "low", low_refresh_hz=60.0)
-        self.assertEqual(target_low, low_mode)
+        self.assertEqual(dr.select_target_mode(info, "mid", low_hz=60.0), mid_mode)
+        self.assertEqual(dr.select_target_mode(info, "low", low_hz=60.0), low_mode)
         # Already at 300 Hz -> high returns None (no-op)
-        self.assertIsNone(dr.select_target_mode(info, "high", low_refresh_hz=60.0))
+        self.assertIsNone(dr.select_target_mode(info, "high", low_hz=60.0))
+        self.assertEqual(
+            dr.build_switch_command(info, mid_mode),
+            ["kscreen-doctor", "output.eDP-2.mode.2"],
+        )
         self.assertEqual(
             dr.build_switch_command(info, low_mode),
             ["kscreen-doctor", "output.eDP-2.mode.3"],
         )
+
+    def test_3tier_panel_matrix_and_explicit_hz_overrides(self) -> None:
+        matrix = [
+            ([300.0, 240.0, 60.0], 300, 240, 60),
+            ([240.0, 165.0, 60.0], 240, 165, 60),
+            ([165.0, 120.0, 60.0], 165, 120, 60),
+            ([144.0, 90.0, 60.0], 144, 90, 60),
+            ([144.0, 60.0], 144, 144, 60),
+            ([120.0, 60.0], 120, 120, 60),
+            ([60.0], 60, 60, 60),
+        ]
+        for rates, exp_high, exp_mid, exp_low in matrix:
+            with self.subTest(rates=rates):
+                modes = [
+                    dr.DisplayMode(
+                        mode_id=str(i + 1),
+                        width=2560,
+                        height=1600,
+                        refresh_hz=r,
+                        is_current=(i == 0),
+                        is_preferred=(i == 0),
+                    )
+                    for i, r in enumerate(rates)
+                ]
+                tiers = dr.choose_refresh_modes(modes, ac_hz=0, battery_hz=0, low_hz=60)
+                assert tiers["high"] and tiers["mid"] and tiers["low"]
+                self.assertEqual(int(round(tiers["high"].refresh_hz)), exp_high)
+                self.assertEqual(int(round(tiers["mid"].refresh_hz)), exp_mid)
+                self.assertEqual(int(round(tiers["low"].refresh_hz)), exp_low)
+
+        # Explicit Hz overrides on a 300/240/120/60 panel
+        quad_modes = [
+            dr.DisplayMode(mode_id="1", width=2560, height=1600, refresh_hz=300.0, is_current=True),
+            dr.DisplayMode(mode_id="2", width=2560, height=1600, refresh_hz=240.0),
+            dr.DisplayMode(mode_id="3", width=2560, height=1600, refresh_hz=120.0),
+            dr.DisplayMode(mode_id="4", width=2560, height=1600, refresh_hz=60.0),
+        ]
+        custom = dr.choose_refresh_modes(quad_modes, ac_hz=240, battery_hz=120, low_hz=60)
+        assert custom["high"] and custom["mid"] and custom["low"]
+        self.assertEqual(int(round(custom["high"].refresh_hz)), 240)
+        self.assertEqual(int(round(custom["mid"].refresh_hz)), 120)
+        self.assertEqual(int(round(custom["low"].refresh_hz)), 60)
+
+    def test_display_refresh_win_devmodes_to_modes(self) -> None:
+        raw = [
+            (2560, 1600, 300, 32),
+            (2560, 1600, 240, 32),
+            (2560, 1600, 60, 32),
+            (2560, 1600, 60, 16),
+        ]
+        info = dr.win_devmodes_to_modes(raw, current_mode=(2560, 1600, 300, 32))
+        self.assertEqual(info.backend, "win32")
+        tiers = dr.choose_refresh_modes(info)
+        assert tiers["high"] and tiers["mid"] and tiers["low"]
+        self.assertAlmostEqual(tiers["high"].refresh_hz, 300.0, places=1)
+        self.assertAlmostEqual(tiers["mid"].refresh_hz, 240.0, places=1)
+        self.assertAlmostEqual(tiers["low"].refresh_hz, 60.0, places=1)
 
     def test_parse_wlr_randr_output_and_mode_selection(self) -> None:
         info = dr.parse_wlr_randr_output(self.WLR_RANDR_SAMPLE)
@@ -561,11 +649,14 @@ DP-1 disconnected (normal left inverted right x axis y axis)
         assert info.current_mode is not None
         self.assertAlmostEqual(info.current_mode.refresh_hz, 165.0, places=2)
 
-        low_mode, high_mode = dr.choose_refresh_modes(info, low_refresh_hz=60.0)
-        assert low_mode is not None and high_mode is not None
+        tiers = dr.choose_refresh_modes(info, low_hz=60.0)
+        high_mode, mid_mode, low_mode = tiers["high"], tiers["mid"], tiers["low"]
+        assert high_mode is not None and mid_mode is not None and low_mode is not None
         self.assertAlmostEqual(low_mode.refresh_hz, 60.0, places=2)
         self.assertEqual((low_mode.width, low_mode.height), (2560, 1600))
         self.assertAlmostEqual(high_mode.refresh_hz, 165.0, places=2)
+        # 2-rate panel (165/60) keeps mid == high (165 Hz)
+        self.assertAlmostEqual(mid_mode.refresh_hz, 165.0, places=2)
         self.assertEqual(
             dr.build_switch_command(info, low_mode),
             ["wlr-randr", "--output", "eDP-1", "--mode", "2560x1600@60.000000Hz"],
@@ -580,10 +671,13 @@ DP-1 disconnected (normal left inverted right x axis y axis)
         assert info.current_mode is not None
         self.assertAlmostEqual(info.current_mode.refresh_hz, 240.0, places=2)
 
-        low_mode, high_mode = dr.choose_refresh_modes(info, low_refresh_hz=60.0)
-        assert low_mode is not None and high_mode is not None
-        self.assertAlmostEqual(low_mode.refresh_hz, 60.0, places=2)
+        tiers = dr.choose_refresh_modes(info, low_hz=60.0)
+        high_mode, mid_mode, low_mode = tiers["high"], tiers["mid"], tiers["low"]
+        assert high_mode is not None and mid_mode is not None and low_mode is not None
         self.assertAlmostEqual(high_mode.refresh_hz, 240.0, places=2)
+        # 3-rate panel (240/120/60) picks 120 Hz for mid
+        self.assertAlmostEqual(mid_mode.refresh_hz, 120.0, places=2)
+        self.assertAlmostEqual(low_mode.refresh_hz, 60.0, places=2)
         self.assertEqual(
             dr.build_switch_command(info, low_mode),
             ["xrandr", "--output", "eDP-1", "--mode", "2560x1600", "--rate", "60.00"],
@@ -599,17 +693,23 @@ DP-1 disconnected (normal left inverted right x axis y axis)
         )
         info = dr.parse_kscreen_output(single_hz)
         assert info is not None
-        low_mode, high_mode = dr.choose_refresh_modes(info, low_refresh_hz=60.0)
-        self.assertIsNone(low_mode)
-        assert high_mode is not None
-        self.assertAlmostEqual(high_mode.refresh_hz, 60.0, places=2)
-        self.assertIsNone(dr.select_target_mode(info, "low", low_refresh_hz=60.0))
+        tiers = dr.choose_refresh_modes(info, low_hz=60.0)
+        assert tiers["high"] and tiers["mid"] and tiers["low"]
+        self.assertAlmostEqual(tiers["high"].refresh_hz, 60.0, places=2)
+        self.assertAlmostEqual(tiers["mid"].refresh_hz, 60.0, places=2)
+        self.assertAlmostEqual(tiers["low"].refresh_hz, 60.0, places=2)
+        self.assertIsNone(dr.select_target_mode(info, "mid", low_hz=60.0))
+        self.assertIsNone(dr.select_target_mode(info, "low", low_hz=60.0))
 
-    def test_controller_switches_without_thrashing_and_restores(self) -> None:
-        state = {"at_low": False}
+    def test_controller_switches_3tier_without_thrashing_and_restores(self) -> None:
+        state = {"mode_id": "1"}
         switch_cmds: list[list[str]] = []
 
         kscreen_high = self.KSCREEN_SAMPLE_ANSI
+        kscreen_mid = self.KSCREEN_SAMPLE_ANSI.replace(
+            "1:\x1b[01;32m2560x1600@300.00*\x1b[0;0m!  2:2560x1600@240.00  3:2560x1600@60.00",
+            "1:2560x1600@300.00!  2:2560x1600@240.00*  3:2560x1600@60.00",
+        )
         kscreen_low = self.KSCREEN_SAMPLE_ANSI.replace(
             "1:\x1b[01;32m2560x1600@300.00*\x1b[0;0m!  2:2560x1600@240.00  3:2560x1600@60.00",
             "1:2560x1600@300.00!  2:2560x1600@240.00  3:2560x1600@60.00*",
@@ -617,46 +717,46 @@ DP-1 disconnected (normal left inverted right x axis y axis)
 
         def fake_runner(cmd: list[str], _timeout: float) -> tuple[int, str, str]:
             if cmd == ["kscreen-doctor", "-o"]:
-                return 0, (kscreen_low if state["at_low"] else kscreen_high), ""
+                out = {"1": kscreen_high, "2": kscreen_mid, "3": kscreen_low}[state["mode_id"]]
+                return 0, out, ""
             if cmd[0] == "kscreen-doctor" and cmd[1].startswith("output.eDP-2.mode."):
                 switch_cmds.append(cmd)
-                state["at_low"] = cmd[1].endswith(".3")
+                state["mode_id"] = cmd[1].rsplit(".", 1)[-1]
                 return 0, "", ""
             return 1, "", "unsupported"
 
         ctrl = dr.DisplayRefreshController(
             runner=fake_runner, probe_interval_sec=60.0, min_switch_interval_sec=5.0
         )
-        # Force kscreen-doctor backend for deterministic test regardless of environment
         ctrl.backend = "kscreen-doctor"
         ctrl.probe(force=True, now=100.0)
 
-        # Already high -> no switch command
-        ctrl.apply_profile("high", low_refresh_hz=60.0, now=101.0)
+        # Already high (300 Hz) -> no switch
+        ctrl.apply_profile("high", ac_hz=0, battery_hz=0, low_hz=60.0, now=101.0)
         self.assertEqual(switch_cmds, [])
 
-        # Enter low -> switches once to mode.3
-        tel_low = ctrl.apply_profile("low", low_refresh_hz=60.0, now=110.0)
-        self.assertEqual(switch_cmds, [["kscreen-doctor", "output.eDP-2.mode.3"]])
-        self.assertAlmostEqual(tel_low["refresh_hz"], 60.0, places=1)
+        # Unplugged >= 20% -> mid (240 Hz, mode.2)
+        tel_mid = ctrl.apply_profile("mid", ac_hz=0, battery_hz=0, low_hz=60.0, now=110.0)
+        self.assertEqual(switch_cmds, [["kscreen-doctor", "output.eDP-2.mode.2"]])
+        self.assertAlmostEqual(tel_mid["refresh_hz"], 240.0, places=1)
+        self.assertEqual(tel_mid["refresh_profile"], "mid")
 
-        # Repeated low tick -> zero additional switch commands
-        ctrl.apply_profile("low", low_refresh_hz=60.0, now=120.0)
+        # Repeated mid tick -> no thrashing
+        ctrl.apply_profile("mid", ac_hz=0, battery_hz=0, low_hz=60.0, now=120.0)
         self.assertEqual(len(switch_cmds), 1)
 
-        # Return to high -> restores mode.1
-        tel_high = ctrl.apply_profile("high", low_refresh_hz=60.0, now=130.0)
-        self.assertEqual(
-            switch_cmds,
-            [
-                ["kscreen-doctor", "output.eDP-2.mode.3"],
-                ["kscreen-doctor", "output.eDP-2.mode.1"],
-            ],
-        )
+        # Unplugged < 20% -> low (60 Hz, mode.3)
+        tel_low = ctrl.apply_profile("low", ac_hz=0, battery_hz=0, low_hz=60.0, now=130.0)
+        self.assertEqual(switch_cmds[-1], ["kscreen-doctor", "output.eDP-2.mode.3"])
+        self.assertAlmostEqual(tel_low["refresh_hz"], 60.0, places=1)
+
+        # Plug AC back in -> high (300 Hz, mode.1)
+        tel_high = ctrl.apply_profile("high", ac_hz=0, battery_hz=0, low_hz=60.0, now=140.0)
+        self.assertEqual(switch_cmds[-1], ["kscreen-doctor", "output.eDP-2.mode.1"])
         self.assertAlmostEqual(tel_high["refresh_hz"], 300.0, places=1)
 
-        # Lower again and verify restore_native() restores 300Hz cleanly
-        ctrl.apply_profile("low", low_refresh_hz=60.0, now=140.0)
+        # Step down to mid again and verify restore_native() restores 300 Hz cleanly
+        ctrl.apply_profile("mid", ac_hz=0, battery_hz=0, low_hz=60.0, now=150.0)
         self.assertTrue(ctrl.restore_native())
         self.assertEqual(switch_cmds[-1], ["kscreen-doctor", "output.eDP-2.mode.1"])
 
@@ -779,24 +879,82 @@ class TestSmartPowerDaemon(unittest.TestCase):
         self.assertFalse(smart_powerd.should_skip_usb_device("ef", {"0e", "fe"}))
         self.assertFalse(smart_powerd.should_skip_usb_device("ff", {"ff"}))
 
-    def test_desired_refresh_profile_logic(self) -> None:
+    def test_desired_refresh_profile_3tier_and_hysteresis(self) -> None:
+        # AC online -> always high (even if previously in low at 15%)
         self.assertEqual(
-            smart_powerd.compute_desired_refresh_profile(True, "light", False, True), "low"
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=True, battery_pct=100, refresh_policy_enabled=True
+            ),
+            "high",
         )
         self.assertEqual(
-            smart_powerd.compute_desired_refresh_profile(True, "light", True, True), "high"
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True,
+                ac_online=True,
+                battery_pct=15,
+                refresh_policy_enabled=True,
+                previous_profile="low",
+            ),
+            "high",
+        )
+        # Smart Optimize OFF or policy disabled -> high
+        self.assertEqual(
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=False, ac_online=False, battery_pct=10, refresh_policy_enabled=True
+            ),
+            "high",
         )
         self.assertEqual(
-            smart_powerd.compute_desired_refresh_profile(True, "heavy", False, True), "high"
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=10, refresh_policy_enabled=False
+            ),
+            "high",
+        )
+        # Desktop without battery -> high
+        self.assertEqual(
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=0, battery_present=False
+            ),
+            "high",
+        )
+        # Unplugged >= 20% -> mid
+        self.assertEqual(
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=80, previous_profile="high"
+            ),
+            "mid",
         )
         self.assertEqual(
-            smart_powerd.compute_desired_refresh_profile(True, "download", False, True), "high"
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=20, previous_profile="mid"
+            ),
+            "mid",
+        )
+        # Unplugged < 20% -> low
+        self.assertEqual(
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=19, previous_profile="mid"
+            ),
+            "low",
+        )
+        # +2% exit hysteresis on battery: 20% and 21% stay low, 22% exits to mid
+        self.assertEqual(
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=20, previous_profile="low"
+            ),
+            "low",
         )
         self.assertEqual(
-            smart_powerd.compute_desired_refresh_profile(False, "off", False, True), "high"
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=21, previous_profile="low"
+            ),
+            "low",
         )
         self.assertEqual(
-            smart_powerd.compute_desired_refresh_profile(True, "light", False, False), "high"
+            smart_powerd.compute_desired_refresh_profile(
+                enabled=True, ac_online=False, battery_pct=22, previous_profile="low"
+            ),
+            "mid",
         )
 
     def test_discover_dgpu_in_synthetic_sysfs(self) -> None:
@@ -986,8 +1144,9 @@ class TestCrossWorkerContracts(unittest.TestCase):
         bad_resp = d.handle_command("rm -rf /")
         self.assertFalse(bad_resp.get("ok"))
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX bash syntax check")
     def test_shell_scripts_syntax_valid(self) -> None:
-        for script in ("install.sh", "uninstall.sh"):
+        for script in ("install.sh", "uninstall.sh", "scripts/build-release.sh"):
             res = subprocess.run(
                 ["bash", "-n", str(REPO_ROOT / script)],
                 capture_output=True,
@@ -997,7 +1156,9 @@ class TestCrossWorkerContracts(unittest.TestCase):
             self.assertEqual(res.returncode, 0, f"bash -n failed for {script}: {res.stderr}")
 
     def test_python_files_parse_cleanly(self) -> None:
-        for py_file in sorted(REPO_ROOT.glob("*.py")):
+        for py_file in sorted(
+            p for p in REPO_ROOT.rglob("*.py") if ".git" not in p.parts
+        ):
             src = py_file.read_text(encoding="utf-8")
             ast.parse(src, filename=str(py_file))
 

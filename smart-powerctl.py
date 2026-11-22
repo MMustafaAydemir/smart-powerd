@@ -24,9 +24,10 @@ from typing import Any
 
 _LIB_DIR = "/usr/local/lib/smart-power"
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
-for _p in (_LIB_DIR, _SCRIPT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+if _LIB_DIR not in sys.path:
+    sys.path.append(_LIB_DIR)
 
 try:
     from smart_power_config import VALID_CONTROL_COMMANDS
@@ -111,8 +112,16 @@ def _format_brightness_line(st: dict[str, Any], disp: dict[str, Any] | None) -> 
 
 
 def _format_refresh_line(st: dict[str, Any], disp: dict[str, Any] | None) -> str:
-    desired = st.get("desired_refresh_profile", "high")
+    desired = str(st.get("desired_refresh_profile", "high"))
+    profile_labels = {
+        "high": "AC / High",
+        "mid": "Battery / Mid",
+        "low": "Low Battery",
+    }
+    tier_label = profile_labels.get(desired, desired)
+    low_pct = st.get("low_battery_refresh_pct", 20)
     low_hz = st.get("low_refresh_hz", 60)
+
     if disp and disp.get("refresh_hz") is not None:
         cur_hz = disp.get("refresh_hz")
         nat_hz = disp.get("native_refresh_hz")
@@ -121,8 +130,11 @@ def _format_refresh_line(st: dict[str, Any], disp: dict[str, Any] | None) -> str
         hz_str = f"{cur_hz:.0f} Hz" if isinstance(cur_hz, (int, float)) else f"{cur_hz} Hz"
         if isinstance(nat_hz, (int, float)) and nat_hz > 0:
             hz_str += f" (native {nat_hz:.0f} Hz)"
-        return f"{hz_str} on {out_name} [{backend}] | desired={desired} (low={low_hz} Hz)"
-    return f"desired={desired} (low={low_hz} Hz) | tray inactive"
+        return (
+            f"{hz_str} [{desired}: {tier_label}] on {out_name} ({backend})"
+            f" | low<{low_pct}% -> {low_hz} Hz"
+        )
+    return f"profile={desired} ({tier_label}) | low<{low_pct}% -> {low_hz} Hz | tray inactive"
 
 
 def print_status(as_json: bool) -> int:
