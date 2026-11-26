@@ -8,7 +8,4 @@
     /usr/local/libexec/smart-powerd-helper reload, \
     /usr/local/libexec/smart-powerd-helper brightness-on, \
     /usr/local/libexec/smart-powerd-helper brightness-off, \
-    /usr/local/libexec/smart-powerd-helper brightness-toggle, \
-    /usr/local/libexec/smart-powerd-helper webcam-als-on, \
-    /usr/local/libexec/smart-powerd-helper webcam-als-off, \
-    /usr/local/libexec/smart-powerd-helper webcam-als-toggle
+    /usr/local/libexec/smart-powerd-helper brightness-toggle

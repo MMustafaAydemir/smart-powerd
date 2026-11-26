@@ -33,9 +33,6 @@ VALID_COMMANDS: frozenset[str] = frozenset(
         "brightness-on",
         "brightness-off",
         "brightness-toggle",
-        "webcam-als-on",
-        "webcam-als-off",
-        "webcam-als-toggle",
     }
 )
 

@@ -56,9 +56,52 @@ jobs:
           cd dist
           sha256sum -c SHA256SUMS.txt
 
+  build-windows-exe:
+    name: Build Windows Executable (smart-powerd.exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Windows runtime & PyInstaller dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-windows.txt pyinstaller
+
+      - name: Build standalone smart-powerd.exe
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File windows/build-exe.ps1
+
+      - name: Verify smart-powerd.exe artifact
+        shell: pwsh
+        run: |
+          $exe = Get-Item "dist\smart-powerd.exe" -ErrorAction Stop
+          if ($exe.Length -le 0) {
+            throw "dist\smart-powerd.exe is empty!"
+          }
+          Write-Host "Built $($exe.FullName) ($($exe.Length) bytes)"
+          $proc = Start-Process -FilePath $exe.FullName -ArgumentList "--version" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "smart-powerd.exe --version exited with code $($proc.ExitCode)"
+          }
+
+      - name: Upload smart-powerd.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smart-powerd-windows-exe
+          path: dist/smart-powerd.exe
+          if-no-files-found: error
+
   release:
     name: Build & Publish GitHub Release
-    needs: [test]
+    needs: [test, build-windows-exe]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -73,10 +116,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Download standalone Windows executable
+        uses: actions/download-artifact@v4
+        with:
+          name: smart-powerd-windows-exe
+          path: dist
+
       - name: Build release artifacts
         run: |
+          test -s dist/smart-powerd.exe
           chmod +x scripts/build-release.sh
           ./scripts/build-release.sh "${GITHUB_REF_NAME}"
+          test -s "dist/smart-powerd-${GITHUB_REF_NAME}-windows.exe"
+          (cd dist && sha256sum -c SHA256SUMS.txt)
 
       - name: Publish GitHub Release
         env:
@@ -84,8 +136,9 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           ASSETS=(
-            "dist/smart-powerd-${TAG}-linux.tar.gz"
+            "dist/smart-powerd-${TAG}-windows.exe"
             "dist/smart-powerd-${TAG}-windows.zip"
+            "dist/smart-powerd-${TAG}-linux.tar.gz"
             "dist/SHA256SUMS.txt"
           )
           if gh release view "${TAG}" >/dev/null 2>&1; then

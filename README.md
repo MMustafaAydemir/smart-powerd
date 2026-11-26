@@ -1,20 +1,20 @@
 # smart-powerd
 
-**Cross-platform (Linux + Windows 10/11) adaptive, workload-aware laptop power, brightness, and 3-tier refresh-rate optimizer.**
+**Cross-platform (Linux + Windows 10/11) adaptive, workload-aware laptop power, day/night circadian brightness, and 3-tier refresh-rate optimizer.**
 
-`smart-powerd` extends battery life and keeps laptops cool and quiet during everyday browsing, coding, and reading—without sacrificing burst responsiveness or full performance during builds, video calls, downloads, or gaming. It is hardware-agnostic, distro-agnostic, reversible, and designed from the ground up to never wake a suspended discrete GPU or interfere with battery charge limits.
+`smart-powerd` extends battery life and keeps laptops cool and quiet during everyday browsing, coding, and reading—without sacrificing burst responsiveness or full performance during builds, video calls, downloads, or gaming. It is hardware-agnostic, distro-agnostic, reversible, zero-camera, and designed from the ground up to never wake a suspended discrete GPU or interfere with battery charge limits.
 
 ---
 
 ## Highlights
 
-- **Cross-Platform (Linux + Windows 10/11)**:
+- **Cross-Platform (Linux + Standalone Windows `.exe`)**:
   - **Linux**: Root systemd daemon (`smart-powerd`) + allowlisted `sudoers` helper + PyQt6 tray (`smart-power-tray`) + CLI (`smart-powerctl`).
-  - **Windows 10/11**: Self-contained Win32 engine + PyQt6 tray & CLI (`windows/smart_power_win.py`) using native `powrprof.dll`, `powercfg`, `ChangeDisplaySettingsExW`, `SetThreadExecutionState`, WMI, and `psutil`—zero external display tools required.
+  - **Windows 10/11**: Downloadable standalone **`smart-powerd.exe`** (zero Python required) or Python source (`windows/smart_power_win.py`) using native Win32 `powrprof.dll`, `powercfg`, `ChangeDisplaySettingsExW`, `SetThreadExecutionState`, WMI, and `psutil`—zero external display tools required.
 - **4-Mode Workload Engine**: Smoothly switches between **Light**, **Download**, **Heavy**, and **Off** modes with 12-second downgrade hysteresis so bursty workloads never flap.
 - **Zero-Lag Light Mode**: Keeps CPU boost/turbo uncapped on Linux (`boost=1` / `no_turbo=0` and full `scaling_max_freq`) with `balance_power` EPP and `balanced` PPD—avoiding the sluggishness of `power-saver` profiles.
 - **Portable 3-Tier Adaptive Refresh Rate**: Automatically matches **AC / Charging (Max Hz)**, **Battery >= 20% (Smart Step-Down Mid Hz)**, and **Battery < 20% (60 Hz Battery Saver)** across any laptop panel on both Linux (KDE/wlroots/GNOME/X11) and Windows (`ChangeDisplaySettingsExW`).
-- **3-Tier Adaptive Screen Brightness**: Blends hardware Ambient Light Sensors (Linux IIO / `iio-sensor-proxy`, Windows WinRT ALS), a privacy-safe single-frame webcam luma fallback (every 30 minutes when no hardware ALS is present, closed-shutter aware, RAM-only, one-click toggleable), and a smooth 24h circadian curve—with automatic manual-override detection.
+- **Pure Day/Night Circadian Screen Brightness**: Smooth 24-hour time-of-day brightness curve with battery scaling, smooth transitions, and automatic manual-override pause—**zero camera access and zero external sensor dependencies**.
 - **Deep Battery Optimization Tricks**: AMD Panel Power Savings (ABM), VM dirty writeback tuning, NMI watchdog disable, SATA/AHCI ALPM, PCIe ASPM, HD-Audio power save, HID-safe USB autosuspend, unused Ethernet/SD-card PCI runtime PM, optional keyboard backlight dimming, and Windows Wi-Fi/PCIe power saving.
 - **D3cold / RTD3 Safe**: Never runs `nvidia-smi` or reads `/proc/driver/nvidia/*`. GPU activity is inspected exclusively via kernel sysfs (`power/runtime_status`, `power_state`), and backlight control skips disconnected/dGPU entries.
 - **Battery Health Safe**: Never modifies OEM battery charge thresholds (`charge_control_*`, `conservation_mode`, etc.)—reports them read-only in status output.
@@ -64,23 +64,15 @@ Need custom targets? Set explicit values in `[battery_tricks]` (e.g. `ac_refresh
 
 ---
 
-## Adaptive Screen Brightness
+## Day/Night Circadian Screen Brightness
 
-Brightness management runs in the user's graphical session using a 3-tier ambient pipeline shared across Linux and Windows:
+Brightness management runs in the user's graphical session using a pure, zero-camera 24-hour circadian time-of-day curve shared across Linux and Windows:
 
-1. **Tier 1 — Hardware Ambient Light Sensor (ALS)**: Reads Linux `iio-sensor-proxy` (`net.hadess.SensorProxy`) / `/sys/bus/iio/devices/iio:device*/in_illuminance_*` (or Windows WinRT ALS) and maps lux logarithmically (`0 lux -> min_pct`, `100 lux -> ~52%`, `400 lux -> ~75%`, `1500+ lux -> max_pct`).
-2. **Tier 2 — Privacy-Safe Webcam Ambient Sensor** *(enabled by default at a 30-minute interval, used ONLY when no hardware ALS is present)*:
-   - Never invoked if a hardware Ambient Light Sensor is available, and toggleable with one click in the tray menu (`Webcam Ambient Sensor`), `smart-powerctl webcam-als off`, or `config.toml` (`webcam_als_enabled = false`).
-   - Checks active camera users before touching the webcam (e.g. `/proc/*/fd` on Linux) and skips cleanly if Zoom, Meet, OBS, or a browser has the camera open.
-   - Captures a tiny **160x120 grayscale probe purely in memory** via `ffmpeg` (4-frame UVC auto-exposure warmup, inspecting only the last frame), detects closed privacy shutters (`max(frame) <= 1` -> falls back cleanly to Circadian Schedule), and closes the device immediately so USB autosuspend sleeps the camera again. **No image is ever written to disk.**
-   - Periodic sampling runs every `webcam_interval_sec` (default `1800s` / 30 minutes), or immediately on demand via **"Measure Room Light Now"** / `smart-powerctl measure-light`.
-3. **Tier 3 — Circadian Time-of-Day Curve**: Smooth piecewise-linear interpolation across 24 hours (with midnight wrap-around). Always works as a standalone fallback and blends cleanly (`70% ambient + 30% schedule`) when an ambient sensor is available so late-night use stays comfortable.
-
-### Battery Scaling, Smooth Stepping & Manual Override Protection
-
+- **Smooth Day/Night Schedule**: Piecewise-linear interpolation across 24 hours with midnight wrap-around (default curve: `00:00 -> 22%`, `06:00 -> 25%`, `08:00 -> 55%`, `12:00 -> 78%`, `17:00 -> 65%`, `20:00 -> 42%`, `22:00 -> 28%`—fully customizable in `config.toml`).
+- **Zero Camera / Zero Sensor Access**: Never opens any camera device, never spawns capture utilities, and never queries hardware light sensors.
 - **Battery Multiplier**: Multiplies the target brightness by `battery_multiplier` (default `0.85`) when unplugged, clamped to `[min_pct, max_pct]` (default `12%..95%`).
 - **Smooth Transitions**: Moves at most `smooth_step_pct` (default `3%`) per polling tick so the screen never flashes abruptly.
-- **Manual Override Detection**: Whenever you press your laptop's brightness Fn keys or drag the OS brightness slider (`>= 4%` delta from the last applied value), automatic brightness pauses for `manual_override_pause_sec` (default `1800s` / 30 minutes). Triggering **"Measure Room Light Now"** or toggling auto-brightness resumes immediately.
+- **Manual Override Detection**: Whenever you press your laptop's brightness Fn keys or drag the OS brightness slider (`>= 4%` delta from the last applied value), automatic brightness pauses for `manual_override_pause_sec` (default `1800s` / 30 minutes). Toggling Auto Brightness off/on resumes immediately.
 - **Safe Backlight Backends**:
   - **Linux**: KDE Plasma 6 D-Bus (`org.kde.Solid.PowerManagement` `setBrightnessSilent`) -> `brightnessctl` targeting the verified internal panel -> direct connected `eDP`/`LVDS` sysfs (`amdgpu_bl*`, `intel_backlight`, `acpi_video*`), strictly rejecting disconnected/dGPU entries (`nvidia_*`).
   - **Windows**: WMI `WmiMonitorBrightness` / `WmiMonitorBrightnessMethods` (silent non-windowed PowerShell).
@@ -113,13 +105,13 @@ Every optimization is toggleable in `config.toml` and restores its captured base
 
 ### Operating Systems & Desktop Environments
 
-| Platform / Environment | Power Engine | Tray UI | Adaptive Brightness | 3-Tier Refresh Rate |
+| Platform / Environment | Power Engine | Tray UI | Circadian Brightness | 3-Tier Refresh Rate |
 | :--- | :--- | :--- | :--- | :--- |
 | **Linux — KDE Plasma 6 (Wayland)** | `smart-powerd` (systemd) | PyQt6 SNI | Native silent D-Bus (`Solid.PowerManagement`) | Native (`kscreen-doctor`) |
 | **Linux — GNOME (Wayland)** | `smart-powerd` (systemd) | PyQt6 (AppIndicator) | `brightnessctl` / sysfs | `gdctl` / `gnome-randr` |
 | **Linux — Hyprland / Sway / wlroots** | `smart-powerd` (systemd) | PyQt6 SNI | `brightnessctl` / sysfs | `wlr-randr` |
 | **Linux — X11 (XFCE, i3, Cinnamon, MATE)** | `smart-powerd` (systemd) | PyQt6 | `brightnessctl` / sysfs | `xrandr` |
-| **Windows 10 / 11 (x64 / ARM64)** | `windows/smart_power_win.py` | PyQt6 (`pythonw.exe`) | WMI + WinRT ALS / `ffmpeg` dshow | Native Win32 `ChangeDisplaySettingsExW` |
+| **Windows 10 / 11 (x64)** | Standalone `smart-powerd.exe` or Python | PyQt6 (tray) | WMI `WmiMonitorBrightness` | Native Win32 `ChangeDisplaySettingsExW` |
 
 ### CPUs, GPUs & Linux Distributions
 
@@ -133,11 +125,12 @@ Every optimization is toggleable in `config.toml` and restores its captured base
 
 ## GitHub Releases (Pre-Packaged Downloads)
 
-Tagged releases on [GitHub Releases](https://github.com/MMustafaAydemir/smart-powerd/releases) include ready-to-install archives and SHA-256 checksums:
+Tagged releases on [GitHub Releases](https://github.com/MMustafaAydemir/smart-powerd/releases) include ready-to-run downloads and SHA-256 checksums:
 
-- `smart-powerd-vX.Y.Z-linux.tar.gz` — complete Linux daemon, tray, CLI, systemd unit, sudoers template, optional `ananicy-cpp` rules, and `install.sh` / `uninstall.sh`
-- `smart-powerd-vX.Y.Z-windows.zip` — complete Windows engine/tray (`windows/smart_power_win.py`), shared Python modules, `requirements-windows.txt`, and PowerShell `install.ps1` / `uninstall.ps1`
-- `SHA256SUMS.txt` — verify downloaded archives before extracting:
+- **`smart-powerd-vX.Y.Z-windows.exe`** — standalone Windows 10/11 executable (double-click to run in the system tray; no Python required!)
+- **`smart-powerd-vX.Y.Z-windows.zip`** — complete Windows bundle containing `smart-powerd.exe`, PowerShell `install.ps1` / `uninstall.ps1` (for logon autostart), `config.example.toml`, and source files
+- **`smart-powerd-vX.Y.Z-linux.tar.gz`** — complete Linux daemon, tray, CLI, systemd unit, sudoers template, optional `ananicy-cpp` rules, and `install.sh` / `uninstall.sh`
+- **`SHA256SUMS.txt`** — verify downloaded artifacts before running:
   ```bash
   sha256sum -c SHA256SUMS.txt
   ```
@@ -153,34 +146,34 @@ Tagged releases on [GitHub Releases](https://github.com/MMustafaAydemir/smart-po
 - **Arch / CachyOS / EndeavourOS**:
   ```bash
   sudo pacman -S python python-pyqt6 python-dbus iw sudo
-  # Optional (recommended for webcam ambient sensor & non-KDE brightness fallback):
-  sudo pacman -S ffmpeg brightnessctl
+  # Optional (recommended for non-KDE brightness fallback):
+  sudo pacman -S brightnessctl
   ```
 - **Fedora**:
   ```bash
   sudo dnf install python3 python3-pyqt6 python3-dbus iw sudo
   # Optional:
-  sudo dnf install ffmpeg brightnessctl
+  sudo dnf install brightnessctl
   ```
 - **Debian / Ubuntu**:
   ```bash
   sudo apt install python3 python3-pyqt6 python3-dbus iw sudo
   # Optional:
-  sudo apt install ffmpeg brightnessctl
+  sudo apt install brightnessctl
   ```
 - **openSUSE**:
   ```bash
   sudo zypper install python311 python311-qt6 python311-dbus-python iw sudo
   # Optional:
-  sudo zypper install ffmpeg brightnessctl
+  sudo zypper install brightnessctl
   ```
 
 ### 2. Download or Clone and Install
 
 From a release tarball:
 ```bash
-tar -xzf smart-powerd-v2.1.0-linux.tar.gz
-cd smart-powerd-v2.1.0-linux
+tar -xzf smart-powerd-v2.2.0-linux.tar.gz
+cd smart-powerd-v2.2.0-linux
 sudo ./install.sh
 ```
 
@@ -210,31 +203,37 @@ On subsequent logins, `smart-power-tray` starts automatically via `~/.config/aut
 
 ## Quick Install — Windows 10 / 11
 
-### Prerequisites
-- **Python 3.11+** installed from [python.org](https://www.python.org/downloads/windows/) or `winget install Python.Python.3.12` (ensure `python` & `pythonw` are on `PATH`).
-- Optional: `ffmpeg` (`winget install Gyan.FFmpeg`) if your laptop has no hardware Ambient Light Sensor and you want the 30-minute privacy-safe webcam fallback.
+### Option A — Standalone Executable (Recommended, Zero Python Required)
 
-### Install via PowerShell
+1. Download **`smart-powerd-v2.2.0-windows.exe`** from [GitHub Releases](https://github.com/MMustafaAydemir/smart-powerd/releases) and double-click it to run directly in the system tray — **or**
+2. Download and extract **`smart-powerd-v2.2.0-windows.zip`** and run the PowerShell installer to register logon autostart:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
+   ```
+   When `smart-powerd.exe` is present in the zip (or `dist/`), `install.ps1` copies it straight to `%LOCALAPPDATA%\smart-powerd\smart-powerd.exe`, copies `config.example.toml` -> `%LOCALAPPDATA%\smart-powerd\config.toml` (only if absent), registers logon autostart under `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run`, and launches the tray immediately—with zero Python or `pip` needed.
 
-Extract `smart-powerd-v2.1.0-windows.zip` (or clone the repo) and run:
+### Option B — Install or Build `.exe` from Git Source
+
+Requires **Python 3.11+** (`winget install Python.Python.3.12`):
 
 ```powershell
+git clone https://github.com/MMustafaAydemir/smart-powerd.git
+cd smart-powerd
+
+# Install directly from Python source (creates venv + pythonw.exe autostart):
 powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
+
+# Or build your own standalone dist\smart-powerd.exe via PyInstaller:
+powershell -ExecutionPolicy Bypass -File .\windows\build-exe.ps1
 ```
 
-What `windows\install.ps1` does:
-1. Checks Python 3.11+ and installs `smart_power_config.py`, `adaptive_brightness.py`, `display_refresh.py`, `windows\smart_power_win.py`, and `requirements-windows.txt` into `%LOCALAPPDATA%\smart-powerd`.
-2. Copies `config.example.toml` -> `%LOCALAPPDATA%\smart-powerd\config.toml` **only if it does not already exist** (preserving user edits across upgrades).
-3. Installs Python dependencies (`PyQt6>=6.5`, `psutil>=5.9`) via `pip` (pass `-SkipPip` to skip).
-4. Registers silent logon autostart under `HKCU:\Software\Microsoft\Windows\CurrentVersion\Run` using `pythonw.exe` (no console window flash) and launches the system tray immediately.
-
-### Windows CLI & Tray Usage
+### Windows Tray & CLI Usage
 
 - **System Tray**:
   - **Left-Click**: Toggle Smart Optimize ON / OFF (green Light, blue Download, amber Heavy, gray Off).
-  - **Hover Tooltip**: Mode, Battery % / Wattage, Power Overlay, Wi-Fi PS, live Refresh Rate Hz + tier, and Brightness % + source.
-  - **Right-Click Menu**: Toggle Smart Optimize, Auto Brightness, Webcam Ambient Sensor, Measure Light Now, Open Config, Quit (restores native max Hz).
-- **CLI**:
+  - **Hover Tooltip**: Mode, Battery % / Wattage, Power Overlay, Wi-Fi PS, live Refresh Rate Hz + tier, and Circadian Brightness %.
+  - **Right-Click Menu**: Toggle Smart Optimize, Auto Brightness (Day/Night Schedule), Open Config, Quit (restores native max Hz).
+- **CLI** (when installed from source or invoking the binary):
   ```powershell
   python "$env:LOCALAPPDATA\smart-powerd\smart_power_win.py" --status
   python "$env:LOCALAPPDATA\smart-powerd\smart_power_win.py" --status --json
@@ -250,7 +249,7 @@ powershell -ExecutionPolicy Bypass -File .\windows\uninstall.ps1
 powershell -ExecutionPolicy Bypass -File .\windows\uninstall.ps1 -Purge
 ```
 
-Restores `Balanced` power overlay, native max display refresh rate, and captured Wi-Fi/PCIe baseline settings, removes the logon autostart entry, and cleans up `%LOCALAPPDATA%\smart-powerd`.
+Stops `smart-powerd.exe` / `smart_power_win.py`, restores `Balanced` power overlay, native max display refresh rate, and captured Wi-Fi/PCIe baseline settings, removes the logon autostart entry, and cleans up `%LOCALAPPDATA%\smart-powerd`.
 
 ---
 
@@ -265,10 +264,10 @@ Key sections in `config.toml`:
 - `[general]` — `poll_interval_sec`, `cooldown_sec`, `wifi_recheck_ticks`
 - `[cpu]` — `light_epp_ac`, `light_epp_battery`, `download_epp`, `heavy_epp`, `uncap_boost_in_light`
 - `[battery_tricks]` — `aspm_light`, `audio_power_save_light`, `dirty_writeback_battery`, `disable_nmi_watchdog`, `sata_alpm_light`, `amd_abm_battery_level`, `usb_autosuspend_non_hid`, `pci_runtime_pm_unused`, `kbd_backlight_dim_battery`, `refresh_policy_enabled`, `ac_refresh_hz`, `battery_refresh_hz`, `low_battery_refresh_pct`, `low_refresh_hz`
-- `[brightness]` — `enabled`, `ambient_source`, `webcam_als_enabled`, `webcam_device`, `webcam_interval_sec`, `battery_multiplier`, `min_pct`, `max_pct`, `smooth_step_pct`, `manual_override_pause_sec`, `schedule`
+- `[brightness]` — `enabled`, `battery_multiplier`, `min_pct`, `max_pct`, `smooth_step_pct`, `manual_override_pause_sec`, `schedule`
 - `[workloads]` — `extra_heavy_processes`, `extra_download_processes`, `rx_threshold_mib_s`, `rx_immediate_mib_s`, `cpu_heavy_pct`, `single_core_heavy_pct`, `heavy_nice`
 
-Runtime toggle overrides made from the tray or CLI (`enabled`, `brightness_enabled`, `webcam_als_enabled`) are persisted separately in `state.json` so your `config.toml` is never rewritten behind your back.
+Runtime toggle overrides made from the tray or CLI (`enabled`, `brightness_enabled`) are persisted separately in `state.json` so your `config.toml` is never rewritten behind your back.
 
 ---
 
@@ -283,24 +282,18 @@ smart-powerctl on                  # Enable adaptive optimization
 smart-powerctl off                 # Pause optimization and restore baseline hardware settings
 smart-powerctl toggle              # Toggle optimization ON / OFF
 smart-powerctl reload              # Hot-reload /etc/smart-powerd/config.toml
-smart-powerctl brightness on       # Enable adaptive brightness
-smart-powerctl brightness off      # Disable adaptive brightness
-smart-powerctl brightness toggle   # Toggle adaptive brightness
-smart-powerctl webcam-als on       # Enable periodic webcam ambient sensing (default: on, 30-min interval)
-smart-powerctl webcam-als off      # Disable periodic webcam ambient sensing
-smart-powerctl webcam-als toggle   # Toggle webcam ambient sensing
-smart-powerctl measure-light       # Trigger one immediate ambient brightness measurement
+smart-powerctl brightness on       # Enable day/night circadian brightness
+smart-powerctl brightness off      # Disable day/night circadian brightness
+smart-powerctl brightness toggle   # Toggle day/night circadian brightness
 ```
 
 ### System Tray (`smart-power-tray`)
 
 - **Left-Click**: Instant one-click toggle of Smart Optimize ON / OFF (passwordless via allowlisted `sudoers`).
-- **Hover Tooltip**: Live mode, trigger reason, battery percentage & discharge wattage, CPU EPP, Wi-Fi power save, dGPU status, panel refresh rate & tier (`AC` / `Battery` / `Low Battery`), and brightness level/source.
+- **Hover Tooltip**: Live mode, trigger reason, battery percentage & discharge wattage, CPU EPP, Wi-Fi power save, dGPU status, panel refresh rate & tier (`AC` / `Battery` / `Low Battery`), and circadian brightness level/status.
 - **Right-Click Menu**:
   - `Turn Smart Optimize OFF / ON`
   - `Auto Brightness: ON / OFF`
-  - `Webcam Ambient Sensor: ON / OFF`
-  - `Measure Room Light Now` (runs a one-shot measurement, clears manual override pause, and adjusts brightness smoothly)
   - `Refresh Status`
   - `Quit Tray` (automatically restores native max panel refresh rate before exiting)
 
@@ -311,7 +304,7 @@ smart-powerctl measure-light       # Trigger one immediate ambient brightness me
 ```text
 /usr/local/lib/smart-power/
 ├── smart_power_config.py          # Shared TOML loader & default schema
-├── adaptive_brightness.py         # 3-tier ambient + circadian brightness controller
+├── adaptive_brightness.py         # Pure day/night circadian brightness controller
 └── display_refresh.py             # Cross-platform 3-tier refresh controller (KDE/wlroots/GNOME/X11/Win32)
 
 /usr/local/sbin/smart-powerd           # Root systemd daemon (reads sysfs, applies power tuning)
@@ -330,7 +323,7 @@ smart-powerctl measure-light       # Trigger one immediate ambient brightness me
 
 ### Security Model (Linux)
 
-`/etc/sudoers.d/smart-powerd` grants detected admin groups (`%wheel` and/or `%sudo`) passwordless execution **only** for `/usr/local/libexec/smart-powerd-helper` with the exact 10 literal subcommands (`on`, `off`, `toggle`, `reload`, `brightness-on`, `brightness-off`, `brightness-toggle`, `webcam-als-on`, `webcam-als-off`, `webcam-als-toggle`). No arbitrary arguments or shell execution are permitted.
+`/etc/sudoers.d/smart-powerd` grants detected admin groups (`%wheel` and/or `%sudo`) passwordless execution **only** for `/usr/local/libexec/smart-powerd-helper` with the exact 7 literal subcommands (`on`, `off`, `toggle`, `reload`, `brightness-on`, `brightness-off`, `brightness-toggle`). No arbitrary arguments or shell execution are permitted.
 
 ---
 
@@ -345,7 +338,7 @@ python3 -m unittest discover -s tests -v
 Build Linux + Windows release archives locally:
 
 ```bash
-./scripts/build-release.sh v2.1.0
+./scripts/build-release.sh v2.2.0
 (cd dist && sha256sum -c SHA256SUMS.txt)
 ```
 

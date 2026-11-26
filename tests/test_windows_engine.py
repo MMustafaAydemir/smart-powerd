@@ -316,7 +316,7 @@ class TestWindowsWorkloadClassifier(unittest.TestCase):
 
 
 class TestWindowsUtilities(unittest.TestCase):
-    """Tests for GUID round-trips, powercfg parsing, DirectShow parsing, and config loading."""
+    """Tests for GUID round-trips, powercfg parsing, frozen bundle lookup, and config loading."""
 
     def test_guid_round_trip(self) -> None:
         for g_str in (
@@ -344,20 +344,6 @@ class TestWindowsUtilities(unittest.TestCase):
         self.assertEqual((ac, dc), (0, 2))
         self.assertEqual(spw.parse_powercfg_ac_dc_indices(""), (None, None))
 
-    def test_parse_dshow_video_devices_prefers_visible_physical_webcam(self) -> None:
-        ffmpeg_stderr = """
-[dshow @ 000001] "OBS Virtual Camera" (video)
-[dshow @ 000001]   Alternative name "@device_sw_obs"
-[dshow @ 000001] "Integrated IR Camera" (video)
-[dshow @ 000001] "Integrated FHD Webcam" (video)
-[dshow @ 000001] "Microphone Array" (audio)
-"""
-        devs = spw.parse_dshow_video_devices(ffmpeg_stderr)
-        self.assertEqual(
-            devs,
-            ["Integrated FHD Webcam", "Integrated IR Camera", "OBS Virtual Camera"],
-        )
-
     def test_load_windows_config_with_partial_toml(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "config.toml"
@@ -370,8 +356,27 @@ class TestWindowsUtilities(unittest.TestCase):
             self.assertEqual(loaded["battery_tricks"]["low_battery_refresh_pct"], 25)
             self.assertEqual(loaded["battery_tricks"]["battery_refresh_hz"], 120)
             self.assertEqual(loaded["battery_tricks"]["low_refresh_hz"], 60)
-            self.assertTrue(loaded["brightness"]["webcam_als_enabled"])
-            self.assertEqual(loaded["brightness"]["webcam_interval_sec"], 1800)
+            self.assertEqual(
+                set(loaded["brightness"].keys()),
+                {
+                    "enabled",
+                    "battery_multiplier",
+                    "min_pct",
+                    "max_pct",
+                    "smooth_step_pct",
+                    "manual_override_pause_sec",
+                    "schedule",
+                },
+            )
+
+    def test_version_flag_and_bundled_config_lookup(self) -> None:
+        self.assertEqual(spw.VERSION, "2.2.0")
+        self.assertEqual(spw.main(["--version"]), 0)
+        bundled = spw.find_bundled_config_example()
+        self.assertIsNotNone(bundled)
+        assert bundled is not None
+        self.assertTrue(bundled.is_file())
+        self.assertEqual(bundled.name, "config.example.toml")
 
 
 if __name__ == "__main__":

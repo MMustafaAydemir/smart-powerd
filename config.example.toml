@@ -2,7 +2,8 @@
 # smart-powerd configuration (/etc/smart-powerd/config.toml)
 # ==============================================================================
 # Copy this file to /etc/smart-powerd/config.toml (install.sh does this
-# automatically if the target file does not yet exist).
+# automatically if the target file does not yet exist; Windows installs to
+# %LOCALAPPDATA%\smart-powerd\config.toml).
 #
 # All sections and keys are optional: any omitted value safely falls back to
 # the built-in defaults shown below. Apply changes without restarting via:
@@ -103,29 +104,9 @@ low_refresh_hz = 60
 
 
 [brightness]
-# Master toggle for adaptive screen brightness (can also be toggled live via
-# tray menu or `smart-powerctl brightness on|off|toggle`).
+# Master toggle for pure day/night circadian screen brightness (can also be
+# toggled live via tray menu or `smart-powerctl brightness on|off|toggle`).
 enabled = true
-
-# Ambient light source selection:
-#   "auto"     - Hardware IIO/SensorProxy ALS -> optional webcam -> schedule
-#   "als"      - Hardware ambient light sensor only (falls back to schedule)
-#   "webcam"   - Privacy-safe single-frame webcam luma + schedule blend
-#   "schedule" - Circadian time-of-day curve only
-ambient_source = "auto"
-
-# Privacy-safe periodic webcam ambient light sensing fallback (used ONLY when
-# no hardware ALS sensor is present). Captures a single 160x120 grayscale frame
-# purely in RAM only when no other app holds the camera open, then closes the
-# device immediately. Toggle live via tray menu or `smart-powerctl webcam-als off`.
-webcam_als_enabled = true
-
-# V4L2 device path for webcam ambient sensing ("auto" picks first usable device,
-# or specify e.g. "/dev/video0").
-webcam_device = "auto"
-
-# Interval in seconds between periodic webcam ambient samples (default 30 min).
-webcam_interval_sec = 1800
 
 # Brightness multiplier applied while running on battery power (0.1..1.0).
 battery_multiplier = 0.85
@@ -141,7 +122,7 @@ smooth_step_pct = 3
 # (Fn keys or desktop slider) is detected.
 manual_override_pause_sec = 1800
 
-# Circadian time-of-day brightness schedule: list of [hour_0_to_24, percent]
+# Day/night circadian brightness schedule: list of [hour_0_to_24, percent]
 # control points interpolated smoothly across midnight wrap-around.
 schedule = [
   [0, 22],

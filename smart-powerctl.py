@@ -6,16 +6,12 @@ Supports:
   smart-powerctl status [--json]
   smart-powerctl on|off|toggle|reload
   smart-powerctl brightness on|off|toggle
-  smart-powerctl webcam-als on|off|toggle
-  smart-powerctl measure-light [--json]
 """
 
 from __future__ import annotations
 
 import json
 import os
-import signal
-import socket
 import subprocess
 import sys
 import time
@@ -40,9 +36,6 @@ except ImportError:
         "brightness-on",
         "brightness-off",
         "brightness-toggle",
-        "webcam-als-on",
-        "webcam-als-off",
-        "webcam-als-toggle",
     )
 
 STATUS_FILE = Path("/run/smart-powerd/status.json")
@@ -55,13 +48,6 @@ def get_display_status_path() -> Path:
     if xdg:
         return Path(xdg) / "smart-power-display.json"
     return Path(f"/tmp/smart-power-display-{os.getuid()}.json")
-
-
-def get_tray_socket_path() -> Path:
-    xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if xdg:
-        return Path(xdg) / "smart-power-tray.sock"
-    return Path(f"/tmp/smart-power-tray-{os.getuid()}.sock")
 
 
 def _read_display_telemetry() -> dict[str, Any] | None:
@@ -78,8 +64,6 @@ def _read_display_telemetry() -> dict[str, Any] | None:
 def _format_brightness_line(st: dict[str, Any], disp: dict[str, Any] | None) -> str:
     bcfg = st.get("brightness_config") if isinstance(st.get("brightness_config"), dict) else {}
     auto_on = bool(bcfg.get("enabled", True))
-    webcam_on = bool(bcfg.get("webcam_als_enabled", True))
-    als_lux = st.get("als_lux")
 
     parts: list[str] = []
     if disp and disp.get("brightness_pct") is not None:
@@ -89,25 +73,16 @@ def _format_brightness_line(st: dict[str, Any], disp: dict[str, Any] | None) -> 
             parts.append(f"{pct}% (target {target}%)")
         else:
             parts.append(f"{pct}%")
-        source = disp.get("brightness_source") or "unknown"
+        source = disp.get("brightness_source") or "Schedule"
         parts.append(f"source={source}")
-        lux = disp.get("ambient_lux") if disp.get("ambient_lux") is not None else als_lux
-        if lux is not None:
-            parts.append(f"lux={lux:.1f}" if isinstance(lux, (int, float)) else f"lux={lux}")
-        elif disp.get("ambient_luma") is not None:
-            luma = disp.get("ambient_luma")
-            parts.append(f"luma={luma:.0f}" if isinstance(luma, (int, float)) else f"luma={luma}")
         pause_until = disp.get("manual_override_until") or 0
         if isinstance(pause_until, (int, float)) and pause_until > time.time():
             mins = max(1, int((pause_until - time.time()) / 60))
             parts.append(f"manual-pause ~{mins}m")
     else:
         parts.append("tray inactive")
-        if als_lux is not None:
-            parts.append(f"ALS={als_lux} lux")
 
     parts.append(f"auto={'ON' if auto_on else 'OFF'}")
-    parts.append(f"webcam-als={'ON' if webcam_on else 'OFF'}")
     return " | ".join(parts)
 
 
@@ -221,102 +196,12 @@ def run_control(cmd: str) -> int:
     return res.returncode
 
 
-def _find_user_tray_pids() -> list[int]:
-    my_uid = os.getuid()
-    pids: list[int] = []
-    try:
-        for entry in os.scandir("/proc"):
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid == os.getpid():
-                continue
-            try:
-                if os.stat(entry.path).st_uid != my_uid:
-                    continue
-                cmdline = Path(entry.path, "cmdline").read_text(
-                    encoding="utf-8", errors="ignore"
-                )
-            except OSError:
-                continue
-            if "smart-power-tray" in cmdline:
-                pids.append(pid)
-    except OSError:
-        pass
-    return pids
-
-
-def run_measure_light(as_json: bool = False) -> int:
-    sock_path = get_tray_socket_path()
-    candidates = [sock_path]
-    fallback_tmp = Path(f"/tmp/smart-power-tray-{os.getuid()}.sock")
-    if fallback_tmp != sock_path:
-        candidates.append(fallback_tmp)
-
-    last_err: str | None = None
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(3.0)
-                sock.connect(str(candidate))
-                sock.sendall((json.dumps({"cmd": "measure-light"}) + "\n").encode("utf-8"))
-                resp_raw = sock.recv(4096).decode("utf-8", errors="ignore").strip()
-            if as_json:
-                print(resp_raw or json.dumps({"ok": True, "message": "measurement triggered"}))
-            else:
-                msg = "Triggered ambient light measurement via smart-power-tray."
-                if resp_raw:
-                    try:
-                        parsed = json.loads(resp_raw)
-                        if parsed.get("message"):
-                            msg = str(parsed["message"])
-                    except ValueError:
-                        pass
-                print(msg)
-            return 0
-        except OSError as exc:
-            last_err = str(exc)
-
-    # Fallback: signal running user-owned smart-power-tray process with SIGUSR1
-    tray_pids = _find_user_tray_pids()
-    signaled = False
-    for pid in tray_pids:
-        try:
-            os.kill(pid, signal.SIGUSR1)
-            signaled = True
-        except OSError:
-            continue
-
-    if signaled:
-        if as_json:
-            print(json.dumps({"ok": True, "message": "SIGUSR1 sent to smart-power-tray"}))
-        else:
-            print("Signaled smart-power-tray (SIGUSR1) to measure ambient light.")
-        return 0
-
-    err_msg = (
-        "smart-power-tray is not running in this user session "
-        f"(socket not found at {sock_path}). Start smart-power-tray to use measure-light."
-    )
-    if last_err:
-        err_msg += f" ({last_err})"
-    if as_json:
-        print(json.dumps({"ok": False, "error": err_msg}))
-    else:
-        print(err_msg, file=sys.stderr)
-    return 1
-
-
 def resolve_control_command(args: list[str]) -> str | None:
     """Map CLI arguments to a validated helper command string, or None."""
     if len(args) == 1 and args[0] in VALID_HELPER_SET:
         return args[0]
     if len(args) == 2 and args[0] == "brightness" and args[1] in {"on", "off", "toggle"}:
         return f"brightness-{args[1]}"
-    if len(args) == 2 and args[0] == "webcam-als" and args[1] in {"on", "off", "toggle"}:
-        return f"webcam-als-{args[1]}"
     return None
 
 
@@ -325,9 +210,7 @@ def print_usage() -> None:
         "Usage:\n"
         "  smart-powerctl status [--json]\n"
         "  smart-powerctl {on|off|toggle|reload}\n"
-        "  smart-powerctl brightness {on|off|toggle}\n"
-        "  smart-powerctl webcam-als {on|off|toggle}\n"
-        "  smart-powerctl measure-light [--json]",
+        "  smart-powerctl brightness {on|off|toggle}",
         file=sys.stderr,
     )
 
@@ -340,13 +223,6 @@ def main(argv: list[str] | None = None) -> int:
             print_usage()
             return 2
         return print_status(as_json=("--json" in extra))
-
-    if args[0] == "measure-light":
-        extra = args[1:]
-        if extra and extra != ["--json"]:
-            print_usage()
-            return 2
-        return run_measure_light(as_json=("--json" in extra))
 
     cmd = resolve_control_command(args)
     if cmd is not None:

@@ -25,9 +25,6 @@ VALID_CONTROL_COMMANDS: tuple[str, ...] = (
     "brightness-on",
     "brightness-off",
     "brightness-toggle",
-    "webcam-als-on",
-    "webcam-als-off",
-    "webcam-als-toggle",
 )
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -61,10 +58,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "brightness": {
         "enabled": True,
-        "ambient_source": "auto",
-        "webcam_als_enabled": True,
-        "webcam_device": "auto",
-        "webcam_interval_sec": 1800,
         "battery_multiplier": 0.85,
         "min_pct": 12,
         "max_pct": 95,
@@ -150,6 +143,15 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
             raw_bt["low_refresh_on_battery_light"]
         )
 
+    # Ignore unknown or legacy removed keys in [brightness] so existing user
+    # configs load cleanly with the pure day/night circadian schedule schema.
+    allowed_brightness_keys = set(DEFAULT_CONFIG["brightness"].keys())
+    merged["brightness"] = {
+        k: v
+        for k, v in merged["brightness"].items()
+        if k in allowed_brightness_keys
+    }
+
     return merged
 
 
@@ -158,17 +160,17 @@ def effective_brightness_config(
 ) -> dict[str, Any]:
     """
     Return the effective brightness configuration with runtime state.json
-    boolean overrides (`brightness_enabled`, `webcam_als_enabled`) applied.
+    boolean override (`brightness_enabled`) applied.
     """
     base = copy.deepcopy(DEFAULT_CONFIG["brightness"])
+    allowed_keys = set(base.keys())
     cfg_section = config.get("brightness") if isinstance(config, dict) else None
     if isinstance(cfg_section, dict):
-        base = deep_merge(base, cfg_section)
+        filtered = {k: v for k, v in cfg_section.items() if k in allowed_keys}
+        base = deep_merge(base, filtered)
 
     if isinstance(state, dict):
         if isinstance(state.get("brightness_enabled"), bool):
             base["enabled"] = state["brightness_enabled"]
-        if isinstance(state.get("webcam_als_enabled"), bool):
-            base["webcam_als_enabled"] = state["webcam_als_enabled"]
 
     return base

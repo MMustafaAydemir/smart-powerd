@@ -6,10 +6,12 @@ usage() {
 Usage: ./scripts/build-release.sh <tag>
 
 Build clean Linux (.tar.gz) and Windows (.zip) release archives plus
-SHA256SUMS.txt under dist/.
+SHA256SUMS.txt under dist/. If dist/smart-powerd.exe is present (built by
+windows/build-exe.ps1), also publishes dist/smart-powerd-<tag>-windows.exe
+and embeds smart-powerd.exe at the root of the Windows zip archive.
 
 Example:
-  ./scripts/build-release.sh v2.1.0
+  ./scripts/build-release.sh v2.2.0
 EOF
 }
 
@@ -60,6 +62,7 @@ WINDOWS_FILES=(
   "windows/smart_power_win.py"
   "windows/install.ps1"
   "windows/uninstall.ps1"
+  "windows/build-exe.ps1"
   "smart_power_config.py"
   "adaptive_brightness.py"
   "display_refresh.py"
@@ -120,9 +123,20 @@ done
 
 LINUX_ARCHIVE="${DIST_DIR}/${LINUX_NAME}.tar.gz"
 WINDOWS_ARCHIVE="${DIST_DIR}/${WINDOWS_NAME}.zip"
+WINDOWS_EXE_SRC="${DIST_DIR}/smart-powerd.exe"
+WINDOWS_EXE_RELEASE="${DIST_DIR}/${WINDOWS_NAME}.exe"
 CHECKSUM_FILE="${DIST_DIR}/SHA256SUMS.txt"
 
-rm -f "${LINUX_ARCHIVE}" "${WINDOWS_ARCHIVE}" "${CHECKSUM_FILE}"
+rm -f "${LINUX_ARCHIVE}" "${WINDOWS_ARCHIVE}" "${WINDOWS_EXE_RELEASE}" "${CHECKSUM_FILE}"
+
+RELEASE_ASSETS=("${LINUX_NAME}.tar.gz" "${WINDOWS_NAME}.zip")
+
+# If standalone Windows executable exists, embed it in zip root and publish standalone copy
+if [[ -f "${WINDOWS_EXE_SRC}" ]]; then
+  copy_file "${WINDOWS_EXE_SRC}" "${WINDOWS_STAGE}/smart-powerd.exe"
+  copy_file "${WINDOWS_EXE_SRC}" "${WINDOWS_EXE_RELEASE}"
+  RELEASE_ASSETS+=("${WINDOWS_NAME}.exe")
+fi
 
 # Build Linux .tar.gz archive (normalized root ownership for reproducible/portable headers)
 tar --owner=0 --group=0 --numeric-owner -C "${STAGE_DIR}" -czf "${LINUX_ARCHIVE}" "${LINUX_NAME}"
@@ -148,10 +162,13 @@ PYEOF
 # Generate and verify SHA-256 checksums (using archive basenames for standard release verification)
 (
   cd "${DIST_DIR}"
-  sha256sum "${LINUX_NAME}.tar.gz" "${WINDOWS_NAME}.zip" > SHA256SUMS.txt
+  sha256sum "${RELEASE_ASSETS[@]}" > SHA256SUMS.txt
   sha256sum -c SHA256SUMS.txt
 )
 
 echo ""
 echo "Release artifacts built under ${DIST_DIR}:"
-ls -lh "${LINUX_ARCHIVE}" "${WINDOWS_ARCHIVE}" "${CHECKSUM_FILE}"
+(
+  cd "${DIST_DIR}"
+  ls -lh "${RELEASE_ASSETS[@]}" SHA256SUMS.txt
+)

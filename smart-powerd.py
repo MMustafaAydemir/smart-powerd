@@ -163,7 +163,6 @@ HEAVY_IMMEDIATE_NAMES = {
     "mangohud",
     "pressure-vessel",
     "blender",
-    "ffmpeg",
     "llama-server",
 }
 
@@ -507,35 +506,6 @@ def discover_pci_by_class(
     return matches
 
 
-def discover_als_lux(iio_root: Path = Path("/sys/bus/iio/devices")) -> float | None:
-    """Read hardware ambient light sensor lux from Linux IIO sysfs, if present."""
-    if not iio_root.is_dir():
-        return None
-    for dev in sorted(iio_root.glob("iio:device*")):
-        inp = read_text(dev / "in_illuminance_input")
-        if inp is not None:
-            try:
-                val = float(inp)
-                if val >= 0.0:
-                    return round(val, 2)
-            except ValueError:
-                pass
-        raw = read_text(dev / "in_illuminance_raw")
-        if raw is not None:
-            try:
-                raw_val = float(raw)
-                offset_s = read_text(dev / "in_illuminance_offset")
-                scale_s = read_text(dev / "in_illuminance_scale")
-                offset = float(offset_s) if offset_s is not None else 0.0
-                scale = float(scale_s) if scale_s is not None else 1.0
-                lux = (raw_val + offset) * scale
-                if lux >= 0.0:
-                    return round(lux, 2)
-            except ValueError:
-                pass
-    return None
-
-
 class SmartPowerDaemon:
     """Portable adaptive power daemon polling /proc and /sys with minimal wakeups."""
 
@@ -766,7 +736,6 @@ class SmartPowerDaemon:
         default_state: dict[str, Any] = {
             "enabled": True,
             "brightness_enabled": None,
-            "webcam_als_enabled": None,
         }
         raw = read_text(STATE_FILE)
         if raw:
@@ -780,13 +749,8 @@ class SmartPowerDaemon:
                             if isinstance(data.get("brightness_enabled"), bool)
                             else None
                         ),
-                        "webcam_als_enabled": (
-                            data["webcam_als_enabled"]
-                            if isinstance(data.get("webcam_als_enabled"), bool)
-                            else None
-                        ),
                     }
-                    # Upgrade older state.json missing the new keys
+                    # Normalize older state.json files cleanly
                     if set(state.keys()) != set(data.keys()):
                         write_json_atomic(STATE_FILE, state, mode=0o644)
                     return state
@@ -1871,7 +1835,6 @@ class SmartPowerDaemon:
             "dirty_writeback_cs": self._read_dirty_writeback_cs(),
             "sata_alpm": self._read_sata_alpm(),
             "charge_thresholds": self._read_charge_thresholds(),
-            "als_lux": discover_als_lux(),
             "desired_refresh_profile": desired_refresh,
             "ac_refresh_hz": ac_refresh_hz,
             "battery_refresh_hz": battery_refresh_hz,
@@ -2022,22 +1985,6 @@ class SmartPowerDaemon:
             return {
                 "ok": True,
                 "brightness_enabled": new_val,
-                "enabled": self.enabled,
-                "mode": self.current_mode or ("light" if self.enabled else "off"),
-            }
-
-        if cmd in {"webcam-als-on", "webcam-als-off", "webcam-als-toggle"}:
-            bcfg = effective_brightness_config(self.config, self.state)
-            if cmd == "webcam-als-toggle":
-                new_val = not bool(bcfg["webcam_als_enabled"])
-            else:
-                new_val = cmd == "webcam-als-on"
-            self.state["webcam_als_enabled"] = new_val
-            self._save_state()
-            self._publish_status()
-            return {
-                "ok": True,
-                "webcam_als_enabled": new_val,
                 "enabled": self.enabled,
                 "mode": self.current_mode or ("light" if self.enabled else "off"),
             }

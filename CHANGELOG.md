@@ -5,6 +5,23 @@ All notable changes to `smart-powerd` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-26
+
+### Added
+- **Standalone Windows Executable (`smart-powerd.exe`)**:
+  - Added `windows/build-exe.ps1` using PyInstaller (`--onefile --windowed`) to package `smart-powerd.exe` with bundled `config.example.toml` and shared modules—requiring zero Python or `pip` installation on end-user Windows 10/11 PCs.
+  - Updated `windows/install.ps1` to auto-detect `smart-powerd.exe` (when present in the release zip or `dist/`), install it directly into `%LOCALAPPDATA%\smart-powerd\smart-powerd.exe`, and register silent logon autostart while preserving Python source fallback.
+  - Added `build-windows-exe` job to `.github/workflows/ci-release.yml` so every push/PR builds & smoke-tests `smart-powerd.exe` and tagged releases automatically publish `smart-powerd-<tag>-windows.exe` alongside `smart-powerd-<tag>-windows.zip`, `smart-powerd-<tag>-linux.tar.gz`, and `SHA256SUMS.txt`.
+
+### Changed
+- **Pure Day/Night Circadian Brightness (Zero Camera or Sensor Code)**:
+  - Simplified `adaptive_brightness.py`, `smart-powerd.py`, `smart-power-tray.py`, `smart-powerctl.py`, and `windows/smart_power_win.py` to use a pure 24-hour day/night circadian schedule with battery multiplier, smooth stepping, manual Fn-key/slider override pause, and dGPU-safe backlight selection.
+  - Streamlined `[brightness]` configuration to 7 clean keys (`enabled`, `battery_multiplier`, `min_pct`, `max_pct`, `smooth_step_pct`, `manual_override_pause_sec`, `schedule`), gracefully ignoring legacy removed keys in older `config.toml` files.
+  - Streamlined the allowlisted privilege helper, `smart-powerd.sudoers`, and `install.sh` to 7 exact control commands (`on`, `off`, `toggle`, `reload`, `brightness-on`, `brightness-off`, `brightness-toggle`).
+
+### Removed
+- Removed all camera/frame capture, external media probe, and ambient light sensor code paths, CLI actions, tray menu toggles, and optional tool checks across both Linux and Windows builds.
+
 ## [2.1.0] - 2026-11-22
 
 ### Added
@@ -13,8 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Wi-Fi adapter power saving and PCIe ASPM tuning via `powercfg`, plus download sleep inhibition via `SetThreadExecutionState`.
   - Native Windows workload detection (`psutil`) with 12-second downgrade cooldown and `ABOVE_NORMAL_PRIORITY_CLASS` boost for active compilers, IDEs, and games.
   - Native Win32 `ChangeDisplaySettingsExW` (`ctypes`) 3-tier refresh rate switching requiring zero external display utilities.
-  - Adaptive brightness reusing the shared `adaptive_brightness` controller with WMI `WmiMonitorBrightnessMethods`, optional WinRT ALS, and privacy-safe `ffmpeg` DirectShow webcam fallback.
-  - PyQt6 system tray applet (matching Linux visual language) with one-click toggle, live wattage/Hz/brightness telemetry, CLI `--status`/`--headless`/`--once` modes, and clean PowerShell installer/uninstaller (`pythonw.exe` logon autostart).
+  - PyQt6 system tray applet (matching Linux visual language) with one-click toggle, live wattage/Hz/brightness telemetry, CLI `--status`/`--headless`/`--once` modes, and clean PowerShell installer/uninstaller.
 - **3-Tier Portable Adaptive Refresh Rate Policy** (`refresh_policy_enabled`, `ac_refresh_hz`, `battery_refresh_hz`, `low_battery_refresh_pct`, `low_refresh_hz`):
   - **AC / Charging (`high`)**: Runs at highest native refresh rate (e.g. `300 Hz`, `240 Hz`, `165 Hz`, `144 Hz`).
   - **Battery >= 20% (`mid`)**: Automatically steps down one tier on panels with 3+ refresh rates (e.g. `300/240/60 -> 240 Hz`, `240/165/60 -> 165 Hz`, `165/120/60 -> 120 Hz`, `144/90/60 -> 90 Hz`), while 2-rate panels (`144/60`, `120/60`) stay smooth at max Hz above 20%.
@@ -39,8 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Dynamic PCI runtime PM for unused Ethernet (`0x0200`, link down only) and SD card readers (`0x0805`), plus HID/Bluetooth/Audio-safe USB autosuspend.
 - **Deep Battery Optimization Tricks**:
   - AMD Panel Power Savings (ABM), VM `dirty_writeback_centisecs`, NMI watchdog disable, SATA/AHCI ALPM, PCIe ASPM, HD-Audio power save, Wi-Fi power save re-checking, keyboard backlight dimming, and read-only battery charge threshold preservation.
-- **3-Tier Adaptive Brightness**:
-  - Hardware IIO / `iio-sensor-proxy` ALS, privacy-safe 30-minute RAM-only webcam luma fallback (with 4-frame warmup and closed privacy shutter detection), smooth 24h circadian schedule, manual override pause, and dGPU-safe backlight backend selection (KDE Plasma 6 silent D-Bus, `brightnessctl`, connected eDP/LVDS sysfs).
 - **Portable Packaging & Configuration**:
   - Shared `/etc/smart-powerd/config.toml` loader (`smart_power_config.py`) with hot-reload (`smart-powerctl reload`), separate `/var/lib/smart-powerd/state.json` runtime toggles, and dynamic `install.sh` / `uninstall.sh` supporting `%wheel` / `%sudo` detection, `visudo -cf` pre-validation, and full baseline restoration.
-- **Comprehensive Test Suite**: 32 unit and cross-worker contract tests including regression coverage for `rclone mount` FUSE exclusion, dynamic EPP governor unlocking, and closed webcam shutter fallback.
+- **Comprehensive Test Suite**: Unit and cross-worker contract tests including regression coverage for `rclone mount` FUSE exclusion and dynamic EPP governor unlocking.

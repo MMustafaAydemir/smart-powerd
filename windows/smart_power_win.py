@@ -5,7 +5,7 @@ smart_power_win.py: Adaptive Windows 10/11 laptop power engine, PyQt6 tray UI, a
 Reuses the shared cross-platform modules from the smart-powerd repository:
   - smart_power_config.py  (TOML config loading & schema defaults)
   - display_refresh.py     (3-tier adaptive refresh rate selection)
-  - adaptive_brightness.py (3-tier ambient light sensing & circadian brightness)
+  - adaptive_brightness.py (pure day/night circadian brightness schedule)
 
 Features on Windows 10/11:
   - Win32 GetSystemPowerStatus + optional WMI root\\WMI BatteryStatus live wattage
@@ -18,9 +18,10 @@ Features on Windows 10/11:
     and ABOVE_NORMAL_PRIORITY_CLASS boost for active builds/games
   - 3-tier adaptive display refresh rate switching via Win32 user32.dll
     (EnumDisplayDevicesW / EnumDisplaySettingsW / ChangeDisplaySettingsExW)
-  - Adaptive display brightness via WMI WmiMonitorBrightness / WmiMonitorBrightnessMethods
-    plus optional WinRT ALS sensor / privacy-safe RAM-only ffmpeg DirectShow webcam probe
-  - PyQt6 system tray UI + CLI (--tray, --headless, --once, --status, --restore)
+  - Pure day/night circadian adaptive brightness via WMI WmiMonitorBrightness /
+    WmiMonitorBrightnessMethods (zero camera or ambient sensor access)
+  - PyQt6 system tray UI + CLI (--tray, --headless, --once, --status, --restore, --version)
+  - PyInstaller frozen executable support (smart-powerd.exe)
 
 All Windows-only Win32 calls are guarded behind ``sys.platform == "win32"`` so
 pure-logic helpers can be imported and unit-tested cleanly on Linux and Windows CI.
@@ -45,6 +46,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+IS_WINDOWS = sys.platform == "win32"
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+CREATE_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+VERSION = "2.2.0"
+
 # Ensure shared repository modules are importable and take precedence over any
 # system-installed copy whether launched from repo/windows/smart_power_win.py
 # OR installed side-by-side in %LOCALAPPDATA%\smart-powerd.
@@ -53,6 +59,8 @@ _PARENT_DIR = _THIS_DIR.parent
 
 
 def _prioritize_local_paths() -> None:
+    if IS_FROZEN:
+        return
     for _path_entry in (str(_PARENT_DIR), str(_THIS_DIR)):
         if _path_entry in sys.path:
             sys.path.remove(_path_entry)
@@ -80,9 +88,6 @@ _prioritize_local_paths()
 
 from adaptive_brightness import (  # noqa: E402
     AdaptiveBrightnessController,
-    WEBCAM_WARMUP_FRAMES,
-    analyze_webcam_frame,
-    extract_last_raw_frame,
     normalize_brightness_config,
 )
 
@@ -90,10 +95,6 @@ try:
     import psutil  # type: ignore[import-untyped]
 except ImportError:
     psutil = None  # type: ignore[assignment]
-
-IS_WINDOWS = sys.platform == "win32"
-CREATE_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
-VERSION = "2.1.0"
 
 # ---------------------------------------------------------------------------
 # Windows Power Overlay / Scheme / Setting GUIDs
@@ -212,6 +213,7 @@ WINDOWS_SYSTEM_EXCLUDED: frozenset[str] = frozenset(
         "applicationframehost.exe",
         "textinputhost.exe",
         "widgets.exe",
+        "smart-powerd.exe",
         "smart_power_win.exe",
         "smart-power-win.exe",
     }
@@ -240,7 +242,6 @@ WINDOWS_HEAVY_IMMEDIATE: frozenset[str] = frozenset(
         "javac.exe",
         "gradle.exe",
         "blender.exe",
-        "ffmpeg.exe",
         "handbrakecli.exe",
         "llama-server.exe",
     }
@@ -384,9 +385,6 @@ NODE_PM_INSTALL_WORDS: frozenset[str] = frozenset(
 )
 
 HEX_INDEX_RE = re.compile(r"0x([0-9a-fA-F]{8})")
-DSHOW_DEVICE_RE = re.compile(r'"([^"]+)"')
-IR_CAMERA_RE = re.compile(r"(?:^|[\s:_-])(?:ir|infrared)(?:$|[\s:_-])", re.IGNORECASE)
-VIRTUAL_CAMERA_RE = re.compile(r"(?:obs|virtual|snap camera|manycam|splitcam)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +475,7 @@ class DEVMODEW(ctypes.Structure):
 
 
 # ---------------------------------------------------------------------------
-# Pure Utility & Config Helpers
+# Pure Utility, PyInstaller Bundle & Config Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -499,6 +497,43 @@ def guid_to_string(guid: GUID) -> str:
     return str(uuid.UUID(bytes=raw))
 
 
+def get_bundle_dirs() -> list[Path]:
+    """
+    Return candidate directories containing bundled resources such as
+    ``config.example.toml`` across PyInstaller onefile (``sys._MEIPASS``),
+    frozen executable directory, installed directory, and repo root.
+    """
+    raw_dirs: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        raw_dirs.append(Path(meipass))
+    if getattr(sys, "frozen", False):
+        try:
+            raw_dirs.append(Path(sys.executable).resolve().parent)
+        except OSError:
+            pass
+    raw_dirs.append(_THIS_DIR)
+    raw_dirs.append(_PARENT_DIR)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for d in raw_dirs:
+        key = str(d)
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+    return unique
+
+
+def find_bundled_config_example() -> Path | None:
+    """Locate bundled ``config.example.toml`` (frozen _MEIPASS, install dir, or repo root)."""
+    for d in get_bundle_dirs():
+        candidate = d / "config.example.toml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def get_windows_data_dir() -> Path:
     """Return %LOCALAPPDATA%\\smart-powerd (with cross-platform fallback for tests)."""
     local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
@@ -515,7 +550,7 @@ def resolve_windows_config_path(explicit_path: str | Path | None = None) -> Path
       1. Explicit CLI path if given
       2. %LOCALAPPDATA%\\smart-powerd\\config.toml (if present)
       3. %ProgramData%\\smart-powerd\\config.toml (if present)
-      4. Repo/install config.example.toml (if present)
+      4. Bundled config.example.toml (_MEIPASS / executable dir / repo root)
       5. Default target %LOCALAPPDATA%\\smart-powerd\\config.toml
     """
     if explicit_path:
@@ -531,9 +566,9 @@ def resolve_windows_config_path(explicit_path: str | Path | None = None) -> Path
         if sys_cfg.is_file():
             return sys_cfg
 
-    for candidate in (_THIS_DIR / "config.example.toml", _PARENT_DIR / "config.example.toml"):
-        if candidate.is_file():
-            return candidate
+    bundled = find_bundled_config_example()
+    if bundled is not None:
+        return bundled
 
     return user_cfg
 
@@ -549,6 +584,7 @@ def load_windows_config(path: str | Path | None = None) -> dict[str, Any]:
     bt.setdefault("battery_refresh_hz", 0)
     bt.setdefault("low_battery_refresh_pct", 20)
     bt.setdefault("low_refresh_hz", 60)
+    cfg["brightness"] = normalize_brightness_config(cfg.get("brightness"))
     return cfg
 
 
@@ -601,39 +637,6 @@ def parse_powercfg_ac_dc_indices(output: str) -> tuple[int | None, int | None]:
     return None, None
 
 
-def parse_dshow_video_devices(stderr_text: str) -> list[str]:
-    """Parse video capture device names from ``ffmpeg -list_devices true -f dshow -i dummy``."""
-    devices: list[str] = []
-    in_video_section = False
-    for line in (stderr_text or "").splitlines():
-        lower = line.lower()
-        if "directshow video devices" in lower:
-            in_video_section = True
-            continue
-        if "directshow audio devices" in lower:
-            in_video_section = False
-            continue
-        if "alternative name" in lower:
-            continue
-        if "(video)" in lower or in_video_section:
-            if "(audio)" in lower:
-                continue
-            m = DSHOW_DEVICE_RE.search(line)
-            if m:
-                name = m.group(1).strip()
-                if name and name not in devices:
-                    devices.append(name)
-    # Prefer visible-light physical webcams over IR or virtual cameras
-    devices.sort(
-        key=lambda name: (
-            1 if VIRTUAL_CAMERA_RE.search(name) else 0,
-            1 if IR_CAMERA_RE.search(name) else 0,
-            name.lower(),
-        )
-    )
-    return devices
-
-
 # ---------------------------------------------------------------------------
 # Pure Testable Core Functions (Linux & Windows CI Contract)
 # ---------------------------------------------------------------------------
@@ -669,7 +672,9 @@ def _extract_devmode_tuple(item: Any) -> tuple[int, int, float, int, bool] | Non
     w_attr = getattr(item, "dmPelsWidth", getattr(item, "width", 0))
     h_attr = getattr(item, "dmPelsHeight", getattr(item, "height", 0))
     hz_attr = getattr(item, "dmDisplayFrequency", getattr(item, "refresh_hz", 0))
-    bpp_attr = getattr(item, "dmBitsPerPel", getattr(item, "bits_per_pel", getattr(item, "bpp", 32)))
+    bpp_attr = getattr(
+        item, "dmBitsPerPel", getattr(item, "bits_per_pel", getattr(item, "bpp", 32))
+    )
     cur_attr = bool(getattr(item, "is_current", False))
     try:
         return (int(w_attr), int(h_attr), float(hz_attr), int(bpp_attr), cur_attr)
@@ -999,7 +1004,7 @@ def classify_windows_workload(
         args_low = [a.lower() for a in args]
         joined_low = " ".join(args_low)
 
-        # Ignore our own script and core Windows OS processes
+        # Ignore our own script/executable and core Windows OS processes
         if "smart_power_win.py" in joined_low or name_low in WINDOWS_SYSTEM_EXCLUDED:
             continue
 
@@ -1051,10 +1056,7 @@ def classify_windows_workload(
             is_heavy = True
             is_boostable = True
             heavy_reason = heavy_reason or f"dev:{raw_name} ({proc_cpu:.0f}%)"
-        elif (
-            not ui_helper
-            and proc_cpu >= single_core_heavy_pct
-        ):
+        elif not ui_helper and proc_cpu >= single_core_heavy_pct:
             is_heavy = True
             is_boostable = True
             heavy_reason = heavy_reason or f"cpu:{raw_name} ({proc_cpu:.0f}%)"
@@ -1431,13 +1433,27 @@ class WindowsPowerBackend:
         ok = True
         if ac_val is not None:
             rc, _, _ = self._runner(
-                ["powercfg", "/setacvalueindex", "SCHEME_CURRENT", subgroup, setting, str(int(ac_val))],
+                [
+                    "powercfg",
+                    "/setacvalueindex",
+                    "SCHEME_CURRENT",
+                    subgroup,
+                    setting,
+                    str(int(ac_val)),
+                ],
                 4.0,
             )
             ok = ok and (rc == 0)
         if dc_val is not None:
             rc, _, _ = self._runner(
-                ["powercfg", "/setdcvalueindex", "SCHEME_CURRENT", subgroup, setting, str(int(dc_val))],
+                [
+                    "powercfg",
+                    "/setdcvalueindex",
+                    "SCHEME_CURRENT",
+                    subgroup,
+                    setting,
+                    str(int(dc_val)),
+                ],
                 4.0,
             )
             ok = ok and (rc == 0)
@@ -1490,7 +1506,9 @@ class WindowsPowerBackend:
             rc, _, _ = self._runner(["powercfg", "/setactive", SCHEME_BALANCED], 4.0)
             scheme = SCHEME_BALANCED
         self.current_overlay = (
-            "High Performance (scheme)" if scheme == SCHEME_HIGH_PERFORMANCE else "Balanced (scheme)"
+            "High Performance (scheme)"
+            if scheme == SCHEME_HIGH_PERFORMANCE
+            else "Balanced (scheme)"
         )
         return rc == 0
 
@@ -1590,7 +1608,6 @@ class WindowsPowerBackend:
         wifi_b = self.baseline.get("wifi_ps") or {}
         w_ac = wifi_b.get("ac", 0)
         w_dc = wifi_b.get("dc", 0)
-        # In OFF mode ensure Wi-Fi is at least baseline (or Max Perf if baseline absent)
         self._set_powercfg_indices(SUBGROUP_WIFI, SETTING_WIFI_PS, w_ac, w_dc)
 
         pcie_b = self.baseline.get("pcie_aspm") or {}
@@ -1935,199 +1952,6 @@ class WindowsBacklightBackend:
         return False
 
 
-class WindowsALSReader:
-    """
-    Optional Windows hardware Ambient Light Sensor reader via WinRT
-    ``Windows.Devices.Sensors.LightSensor`` (gracefully returns None if absent).
-    """
-
-    def __init__(self, poll_interval_sec: float = 15.0) -> None:
-        self._poll_interval_sec = float(poll_interval_sec)
-        self._checked_available: bool = False
-        self._available: bool = False
-        self._last_ts: float = 0.0
-        self._cached_lux: float | None = None
-        self._winrt_sensor: Any = None
-
-    def _init_winrt_python(self) -> bool:
-        if not IS_WINDOWS:
-            return False
-        try:
-            from winrt.windows.devices.sensors import LightSensor  # type: ignore[import-not-found]
-
-            sensor = LightSensor.get_default()
-            if sensor is not None:
-                self._winrt_sensor = sensor
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _probe_ps_winrt(self) -> float | None:
-        if not IS_WINDOWS:
-            return None
-        script = (
-            "$ErrorActionPreference='SilentlyContinue'; "
-            "[Windows.Devices.Sensors.LightSensor,Windows.Devices.Sensors,ContentType=WindowsRuntime] | Out-Null; "
-            "$s = [Windows.Devices.Sensors.LightSensor]::GetDefault(); "
-            "if ($s) { $r = $s.GetCurrentReading(); if ($r) { Write-Output $r.IlluminanceInLux } }"
-        )
-        rc, out, _ = _run_powershell(script, timeout=3.0)
-        if rc == 0 and out.strip():
-            try:
-                val = float(out.strip().splitlines()[-1])
-                if math.isfinite(val) and val >= 0.0:
-                    return val
-            except ValueError:
-                pass
-        return None
-
-    def read_lux(self, daemon_als_lux: float | None = None) -> float | None:
-        if daemon_als_lux is not None:
-            try:
-                val = float(daemon_als_lux)
-                if math.isfinite(val) and val >= 0.0:
-                    return val
-            except (TypeError, ValueError):
-                pass
-        if not IS_WINDOWS:
-            return None
-
-        now = time.time()
-        if not self._checked_available:
-            self._checked_available = True
-            if self._init_winrt_python():
-                self._available = True
-            else:
-                probe = self._probe_ps_winrt()
-                self._available = probe is not None
-                self._cached_lux = probe
-                self._last_ts = now
-                return probe
-
-        if not self._available:
-            return None
-
-        if self._winrt_sensor is not None:
-            try:
-                reading = self._winrt_sensor.get_current_reading()
-                if reading is not None:
-                    lux = float(reading.illuminance_in_lux)
-                    if math.isfinite(lux) and lux >= 0.0:
-                        self._cached_lux = lux
-                        return lux
-            except Exception:
-                self._available = False
-                return None
-
-        if (now - self._last_ts) >= self._poll_interval_sec:
-            self._last_ts = now
-            self._cached_lux = self._probe_ps_winrt()
-        return self._cached_lux
-
-    def cleanup(self) -> None:
-        self._winrt_sensor = None
-
-
-def measure_windows_webcam_luma(
-    device: str = "auto",
-    timeout_sec: float = 6.0,
-    warmup_frames: int = WEBCAM_WARMUP_FRAMES,
-) -> tuple[float | None, str]:
-    """
-    Privacy-safe RAM-only webcam ambient luma probe on Windows via ``ffmpeg -f dshow``.
-
-    - Never writes any image or temporary file to disk.
-    - Runs silently with CREATE_NO_WINDOW.
-    - Captures ``warmup_frames`` grayscale frames to stdout pipe, inspects only the
-      final frame, and rejects closed privacy shutters via ``analyze_webcam_frame``.
-    """
-    if not IS_WINDOWS:
-        return None, "not-windows"
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if not ffmpeg_bin:
-        return None, "ffmpeg-missing"
-
-    cam_name = (device or "auto").strip()
-    if not cam_name or cam_name.lower() == "auto":
-        _, _, list_err = _run_hidden(
-            [ffmpeg_bin, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-            timeout=4.0,
-        )
-        cams = parse_dshow_video_devices(list_err)
-        if not cams:
-            return None, "no-webcam"
-        cam_name = cams[0]
-
-    frame_count = max(1, int(warmup_frames))
-    attempts = [
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "dshow",
-            "-video_size",
-            "160x120",
-            "-i",
-            f"video={cam_name}",
-            "-frames:v",
-            str(frame_count),
-            "-pix_fmt",
-            "gray",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ],
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "dshow",
-            "-i",
-            f"video={cam_name}",
-            "-frames:v",
-            str(frame_count),
-            "-pix_fmt",
-            "gray",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ],
-    ]
-
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "timeout": timeout_sec,
-        "check": False,
-    }
-    if CREATE_NO_WINDOW:
-        kwargs["creationflags"] = CREATE_NO_WINDOW
-
-    for cmd in attempts:
-        try:
-            proc = subprocess.run(cmd, **kwargs)
-        except subprocess.TimeoutExpired:
-            return None, "webcam-timeout"
-        except OSError:
-            return None, "webcam-error"
-
-        if proc.returncode == 0 and proc.stdout:
-            last_frame = extract_last_raw_frame(proc.stdout, frame_count=frame_count)
-            return analyze_webcam_frame(last_frame)
-
-        err_low = (proc.stderr or b"").decode("utf-8", errors="ignore").lower()
-        if "in use" in err_low or "busy" in err_low or "cannot use device" in err_low:
-            return None, "webcam-busy"
-
-    return None, "webcam-capture-failed"
-
-
 # ---------------------------------------------------------------------------
 # Adaptive Windows Power Engine
 # ---------------------------------------------------------------------------
@@ -2140,7 +1964,7 @@ class WindowsPowerEngine:
       - Power overlay / Wi-Fi PS / PCIe ASPM / USB Selective Suspend
       - Sleep inhibition during active downloads
       - 3-tier adaptive display refresh rate
-      - 3-tier adaptive display brightness
+      - Pure day/night circadian adaptive display brightness (WMI)
       - Persistent state.json, baseline.json, and live status.json telemetry
     """
 
@@ -2164,7 +1988,6 @@ class WindowsPowerEngine:
         self.refresh_ctrl = WindowsDisplayRefreshController()
         self.brightness_ctrl = AdaptiveBrightnessController(
             backend=WindowsBacklightBackend(),
-            als_reader=WindowsALSReader(),
         )
 
         self.current_mode: str = "light" if self.enabled else "off"
@@ -2175,9 +1998,7 @@ class WindowsPowerEngine:
         self._rx_streak: int = 0
         self._cpu_streak: int = 0
         self._prev_refresh_profile: str = "high"
-        self._last_measure_note: str = ""
         self._own_pid: int = os.getpid()
-        self._num_cpus: int = max(1, os.cpu_count() or 1)
         self.last_status: dict[str, Any] = {}
 
         # Prime psutil CPU counters so the first tick has meaningful deltas
@@ -2195,7 +2016,6 @@ class WindowsPowerEngine:
         default_state: dict[str, Any] = {
             "enabled": True,
             "brightness_enabled": None,
-            "webcam_als_enabled": None,
         }
         raw = read_json_file(self.state_path)
         if raw is None:
@@ -2236,12 +2056,6 @@ class WindowsPowerEngine:
         self._save_state()
         if not cur:
             self.brightness_ctrl.clear_manual_override()
-        return not cur
-
-    def toggle_webcam_als(self) -> bool:
-        cur = bool(self.effective_brightness_cfg().get("webcam_als_enabled", True))
-        self.state["webcam_als_enabled"] = not cur
-        self._save_state()
         return not cur
 
     def _sample_system_metrics(self, now: float) -> tuple[list[dict[str, Any]], float, float, float]:
@@ -2291,7 +2105,6 @@ class WindowsPowerEngine:
             ):
                 try:
                     info = p.info
-                    # psutil process cpu_percent can be up to num_cpus*100; normalize only if needed
                     raw_pcpu = float(info.get("cpu_percent") or 0.0)
                     procs.append(
                         {
@@ -2331,7 +2144,7 @@ class WindowsPowerEngine:
             except Exception:
                 continue
 
-    def tick(self, now: float | None = None, run_sync_webcam: bool = False) -> dict[str, Any]:
+    def tick(self, now: float | None = None) -> dict[str, Any]:
         """Run one adaptive evaluation cycle, apply changes, and publish status.json."""
         ts = time.time() if now is None else float(now)
         gen_cfg = self.config.get("general", {})
@@ -2377,7 +2190,11 @@ class WindowsPowerEngine:
                 self._applied_mode = "off"
         else:
             cooldown_sec = float(gen_cfg.get("cooldown_sec", 12.0))
-            prev_mode = self.current_mode if self.current_mode in ("light", "download", "heavy") else "light"
+            prev_mode = (
+                self.current_mode
+                if self.current_mode in ("light", "download", "heavy")
+                else "light"
+            )
             eff_mode, self._last_higher_ts = apply_mode_cooldown(
                 desired_mode=cls["mode"],
                 current_mode=prev_mode,
@@ -2430,18 +2247,7 @@ class WindowsPowerEngine:
             enabled=self.enabled and refresh_enabled,
         )
 
-        # Adaptive brightness (synchronous webcam only in --headless/--once; tray runs it in QThread)
-        if run_sync_webcam and self.brightness_ctrl.should_sample_webcam(bcfg, now=ts):
-            luma, cam_status = measure_windows_webcam_luma(
-                device=str(bcfg.get("webcam_device", "auto"))
-            )
-            self.brightness_ctrl.ingest_webcam_luma(luma, status=cam_status, now=ts, manual=False)
-            self._last_measure_note = (
-                "shutter closed"
-                if cam_status == "webcam-shutter-closed"
-                else ("webcam busy" if cam_status == "webcam-busy" else "")
-            )
-
+        # Pure day/night circadian adaptive brightness
         bright_tel = self.brightness_ctrl.update(config=bcfg, ac_online=ac_online, now=ts)
 
         status: dict[str, Any] = {
@@ -2518,22 +2324,16 @@ def format_refresh_line(status: dict[str, Any]) -> str:
     return f"{_format_hz(cur_hz)} ({tier})"
 
 
-def format_brightness_line(status: dict[str, Any], measure_note: str = "") -> str:
+def format_brightness_line(status: dict[str, Any]) -> str:
     pct = status.get("brightness_pct")
     source = str(status.get("brightness_source") or "Unavailable")
     override_until = float(status.get("manual_override_until") or 0.0)
-    lux = status.get("ambient_lux")
     if pct is None:
         return f"Unavailable ({source})"
-    detail = source
     if source == "Manual Pause":
         rem_min = max(1, int(round((override_until - time.time()) / 60.0)))
-        detail = f"Manual Pause ({rem_min}m)"
-    elif source == "ALS" and isinstance(lux, (int, float)):
-        detail = f"ALS ({int(round(lux))} lux)"
-    elif source == "Schedule" and measure_note:
-        detail = f"Schedule ({measure_note})"
-    return f"{pct}% — {detail}"
+        return f"{pct}% (Manual Pause - {rem_min}m)"
+    return f"{pct}% ({source})"
 
 
 def format_battery_line(status: dict[str, Any]) -> str:
@@ -2575,7 +2375,7 @@ def format_status_report(status: dict[str, Any]) -> str:
 
 def _run_tray_app(engine: WindowsPowerEngine) -> int:
     try:
-        from PyQt6.QtCore import QPointF, Qt, QThread, QTimer, pyqtSignal
+        from PyQt6.QtCore import QPointF, Qt, QTimer
         from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
         from PyQt6.QtNetwork import QLocalServer, QLocalSocket
         from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -2656,18 +2456,6 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
         painter.end()
         return QIcon(pixmap)
 
-    class WebcamMeasureWorkerWin(QThread):
-        measured = pyqtSignal(object, str, bool)
-
-        def __init__(self, device: str, manual: bool, parent: Any = None) -> None:
-            super().__init__(parent)
-            self._device = device
-            self._manual = manual
-
-        def run(self) -> None:
-            luma, cam_status = measure_windows_webcam_luma(device=self._device, timeout_sec=6.0)
-            self.measured.emit(luma, cam_status, self._manual)
-
     def acquire_lock(server_name: str) -> QLocalServer | None:
         probe = QLocalSocket()
         probe.connectToServer(server_name)
@@ -2692,7 +2480,6 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
         def __init__(self) -> None:
             self._icon_cache: dict[str, QIcon] = {}
             self._last_icon_key: str | None = None
-            self._webcam_worker: WebcamMeasureWorkerWin | None = None
             self._cleaned_up = False
 
             self.tray = QSystemTrayIcon()
@@ -2726,14 +2513,6 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             self.act_brightness_toggle.triggered.connect(self._on_brightness_toggle)
             self.menu.addAction(self.act_brightness_toggle)
 
-            self.act_webcam_toggle = QAction("Webcam Ambient Sensor: ON", self.menu)
-            self.act_webcam_toggle.triggered.connect(self._on_webcam_toggle)
-            self.menu.addAction(self.act_webcam_toggle)
-
-            self.act_measure = QAction("Measure Room Light Now", self.menu)
-            self.act_measure.triggered.connect(self._on_measure_light)
-            self.menu.addAction(self.act_measure)
-
             self.act_open_config = QAction("Open Config", self.menu)
             self.act_open_config.triggered.connect(self._on_open_config)
             self.menu.addAction(self.act_open_config)
@@ -2750,13 +2529,13 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
 
             self.tray.setContextMenu(self.menu)
 
-            self.ramp_timer = QTimer(app)
-            self.ramp_timer.setInterval(140)
-            self.ramp_timer.timeout.connect(self._on_ramp_tick)
-
             poll_ms = max(
                 1000,
-                int(round(float(engine.config.get("general", {}).get("poll_interval_sec", 2.5)) * 1000)),
+                int(
+                    round(
+                        float(engine.config.get("general", {}).get("poll_interval_sec", 2.5)) * 1000
+                    )
+                ),
             )
             self.poll_timer = QTimer(app)
             self.poll_timer.timeout.connect(self._on_poll)
@@ -2778,74 +2557,8 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
                 self._icon_cache[key] = render_tray_icon(mode, enabled)
             return self._icon_cache[key]
 
-        def _launch_webcam(self, device: str, manual: bool) -> bool:
-            if self._webcam_worker is not None and self._webcam_worker.isRunning():
-                return False
-            worker = WebcamMeasureWorkerWin(device=device, manual=manual, parent=app)
-            worker.measured.connect(self._on_webcam_done)
-            worker.finished.connect(self._on_webcam_finished)
-            self._webcam_worker = worker
-            worker.start()
-            return True
-
-        def _on_webcam_finished(self) -> None:
-            w = self._webcam_worker
-            self._webcam_worker = None
-            if w is not None:
-                w.deleteLater()
-
-        def _on_webcam_done(self, luma: Any, cam_status: str, manual: bool) -> None:
-            now = time.time()
-            bcfg = engine.effective_brightness_cfg()
-            luma_val = float(luma) if isinstance(luma, (int, float)) else None
-            engine.brightness_ctrl.ingest_webcam_luma(
-                luma_val,
-                status=cam_status,
-                now=now,
-                manual=manual,
-                manual_ttl_sec=max(float(bcfg["webcam_interval_sec"]), 300.0),
-            )
-            if cam_status == "webcam-busy":
-                engine._last_measure_note = "webcam busy"
-            elif cam_status == "webcam-shutter-closed":
-                engine._last_measure_note = "shutter closed"
-            elif cam_status != "ok" and manual:
-                engine._last_measure_note = cam_status.replace("-", " ")
-            else:
-                engine._last_measure_note = ""
-
-            ac_online = bool(engine.last_status.get("ac_online", True))
-            engine.brightness_ctrl.update(
-                config=bcfg,
-                ac_online=ac_online,
-                now=now,
-                force_measure=manual,
-            )
-            if manual and engine.brightness_ctrl.last_target_pct is not None:
-                cur = engine.brightness_ctrl.last_current_pct
-                if cur is not None and cur != engine.brightness_ctrl.last_target_pct:
-                    self.ramp_timer.start()
-
-            if engine.last_status:
-                engine.last_status.update(engine.brightness_ctrl.get_telemetry())
-                atomic_write_json(engine.status_path, engine.last_status)
-                self._refresh_ui(engine.last_status)
-
-        def _on_ramp_tick(self) -> None:
-            bcfg = engine.effective_brightness_cfg()
-            step = max(2, int(bcfg.get("smooth_step_pct", 3)))
-            if not engine.brightness_ctrl.step_ramp(step_size=step):
-                self.ramp_timer.stop()
-            if engine.last_status:
-                engine.last_status.update(engine.brightness_ctrl.get_telemetry())
-                self._refresh_ui(engine.last_status)
-
         def _on_poll(self) -> None:
-            now = time.time()
-            bcfg = engine.effective_brightness_cfg()
-            if engine.brightness_ctrl.should_sample_webcam(bcfg, now=now):
-                self._launch_webcam(str(bcfg.get("webcam_device", "auto")), manual=False)
-            st = engine.tick(now=now, run_sync_webcam=False)
+            st = engine.tick(now=time.time())
             self._refresh_ui(st)
 
         def _refresh_ui(self, st: dict[str, Any]) -> None:
@@ -2863,7 +2576,7 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             overlay = str(st.get("power_overlay") or "Unknown")
             wifi_ps = str(st.get("wifi_power_save") or "Unknown")
             refresh_line = format_refresh_line(st)
-            bright_line = format_brightness_line(st, engine._last_measure_note)
+            bright_line = format_brightness_line(st)
             bcfg = engine.effective_brightness_cfg()
 
             tooltip = (
@@ -2889,9 +2602,6 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             self.act_brightness_toggle.setText(
                 f"Auto Brightness: {'ON' if bcfg.get('enabled', True) else 'OFF'}"
             )
-            self.act_webcam_toggle.setText(
-                f"Webcam Ambient Sensor: {'ON' if bcfg.get('webcam_als_enabled', True) else 'OFF'}"
-            )
 
         def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
             if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -2905,44 +2615,13 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             engine.toggle_brightness()
             self._on_poll()
 
-        def _on_webcam_toggle(self) -> None:
-            engine.toggle_webcam_als()
-            self._on_poll()
-
-        def _on_measure_light(self) -> None:
-            self.ramp_timer.stop()
-            engine.brightness_ctrl.clear_manual_override()
-            engine._last_measure_note = ""
-            now = time.time()
-            bcfg = engine.effective_brightness_cfg()
-            if engine.brightness_ctrl.should_sample_webcam(bcfg, now=now, force=True):
-                self.act_brightness.setText("Brightness: Measuring room light...")
-                self._launch_webcam(str(bcfg.get("webcam_device", "auto")), manual=True)
-                return
-
-            ac_online = bool(engine.last_status.get("ac_online", True))
-            engine.brightness_ctrl.update(
-                config=bcfg, ac_online=ac_online, now=now, force_measure=True
-            )
-            if (
-                engine.brightness_ctrl.last_target_pct is not None
-                and engine.brightness_ctrl.last_current_pct is not None
-                and engine.brightness_ctrl.last_current_pct != engine.brightness_ctrl.last_target_pct
-            ):
-                self.ramp_timer.start()
-            self._on_poll()
-
         def _on_open_config(self) -> None:
             target = engine.data_dir / "config.toml"
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.is_file():
-                for example in (
-                    _THIS_DIR / "config.example.toml",
-                    _PARENT_DIR / "config.example.toml",
-                ):
-                    if example.is_file():
-                        shutil.copy2(example, target)
-                        break
+                bundled = find_bundled_config_example()
+                if bundled is not None:
+                    shutil.copy2(bundled, target)
             if IS_WINDOWS and hasattr(os, "startfile"):
                 try:
                     os.startfile(str(target))  # type: ignore[attr-defined]
@@ -2962,9 +2641,6 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
                 return
             self._cleaned_up = True
             self.poll_timer.stop()
-            self.ramp_timer.stop()
-            if self._webcam_worker is not None and self._webcam_worker.isRunning():
-                self._webcam_worker.wait(1500)
             engine.restore_all()
             lock_server.close()
 
@@ -2979,8 +2655,8 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="smart_power_win.py",
-        description="Adaptive Windows 10/11 laptop power, refresh-rate, and brightness optimizer.",
+        prog="smart-powerd",
+        description="Adaptive Windows 10/11 laptop power, refresh-rate, and circadian brightness optimizer.",
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -3021,15 +2697,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--version",
-        action="version",
-        version=f"smart-powerd {VERSION} (Windows)",
+        action="store_true",
+        help="Print version and exit 0.",
     )
     return parser
 
 
+def _ensure_std_streams() -> None:
+    """Guard against None stdout/stderr in PyInstaller --windowed executables."""
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _ensure_std_streams()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+
+    if args.version:
+        print(f"smart-powerd {VERSION}", flush=True)
+        return 0
 
     if args.status:
         status_file = get_windows_data_dir() / "status.json"
@@ -3037,29 +2726,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         if data is None:
             print(
                 f"smart-powerd status unavailable ({status_file} not found). "
-                "Start smart_power_win.py first.",
+                "Start smart-powerd first.",
                 file=sys.stderr,
             )
             return 1
         if args.json:
-            print(json.dumps(data, indent=2))
+            print(json.dumps(data, indent=2), flush=True)
         else:
-            print(format_status_report(data))
+            print(format_status_report(data), flush=True)
         return 0
 
     engine = WindowsPowerEngine(config_path=args.config)
 
     if args.restore:
         engine.restore_all()
-        print("Restored baseline Windows power scheme, Wi-Fi/PCIe settings, and native refresh rate.")
+        print(
+            "Restored baseline Windows power scheme, Wi-Fi/PCIe settings, and native refresh rate.",
+            flush=True,
+        )
         return 0
 
     if args.once:
-        st = engine.tick(run_sync_webcam=False)
+        st = engine.tick()
         if args.json:
-            print(json.dumps(st, indent=2))
+            print(json.dumps(st, indent=2), flush=True)
         else:
-            print(format_status_report(st))
+            print(format_status_report(st), flush=True)
         return 0
 
     if args.headless:
@@ -3075,7 +2767,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         try:
             while running:
-                engine.tick(run_sync_webcam=True)
+                engine.tick()
                 interval = max(
                     0.5,
                     float(engine.config.get("general", {}).get("poll_interval_sec", 2.5)),

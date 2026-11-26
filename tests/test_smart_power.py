@@ -67,22 +67,6 @@ class FakeBacklightBackend:
         return True
 
 
-class FakeALSReader:
-    """In-memory hardware ALS reader for deterministic tests."""
-
-    def __init__(self, lux: float | None = None) -> None:
-        self.lux = lux
-        self.cleaned_up = False
-
-    def read_lux(self, daemon_als_lux: float | None = None) -> float | None:
-        if daemon_als_lux is not None:
-            return float(daemon_als_lux)
-        return self.lux
-
-    def cleanup(self) -> None:
-        self.cleaned_up = True
-
-
 class TestSmartPowerConfig(unittest.TestCase):
     """Tests for smart_power_config.py and config.example.toml schema parity."""
 
@@ -91,8 +75,18 @@ class TestSmartPowerConfig(unittest.TestCase):
             missing = Path(tmp) / "does-not-exist.toml"
             cfg = spc.load_config(missing)
             self.assertEqual(cfg, spc.DEFAULT_CONFIG)
-            self.assertTrue(cfg["brightness"]["webcam_als_enabled"])
-            self.assertEqual(cfg["brightness"]["webcam_interval_sec"], 1800)
+            self.assertEqual(
+                set(cfg["brightness"].keys()),
+                {
+                    "enabled",
+                    "battery_multiplier",
+                    "min_pct",
+                    "max_pct",
+                    "smooth_step_pct",
+                    "manual_override_pause_sec",
+                    "schedule",
+                },
+            )
             # Mutating returned dict must not pollute DEFAULT_CONFIG
             cfg["general"]["cooldown_sec"] = 999.0
             cfg["workloads"]["extra_heavy_processes"].append("custom-sim")
@@ -109,7 +103,7 @@ light_epp_battery = "power"
 
 [brightness]
 min_pct = 18
-webcam_als_enabled = false
+battery_multiplier = 0.80
 
 [workloads]
 extra_heavy_processes = ["my_solver", "sim_runner"]
@@ -123,7 +117,7 @@ extra_heavy_processes = ["my_solver", "sim_runner"]
         self.assertEqual(loaded["general"]["cooldown_sec"], 20.0)
         self.assertEqual(loaded["cpu"]["light_epp_battery"], "power")
         self.assertEqual(loaded["brightness"]["min_pct"], 18)
-        self.assertFalse(loaded["brightness"]["webcam_als_enabled"])
+        self.assertAlmostEqual(loaded["brightness"]["battery_multiplier"], 0.80, places=2)
         self.assertEqual(
             loaded["workloads"]["extra_heavy_processes"], ["my_solver", "sim_runner"]
         )
@@ -134,7 +128,7 @@ extra_heavy_processes = ["my_solver", "sim_runner"]
         self.assertEqual(loaded["cpu"]["light_epp_ac"], "balance_power")
         self.assertTrue(loaded["cpu"]["uncap_boost_in_light"])
         self.assertEqual(loaded["brightness"]["max_pct"], 95)
-        self.assertEqual(loaded["brightness"]["webcam_interval_sec"], 1800)
+        self.assertEqual(loaded["brightness"]["smooth_step_pct"], 3)
         self.assertEqual(loaded["battery_tricks"], spc.DEFAULT_CONFIG["battery_tricks"])
 
     def test_invalid_malformed_and_directory_path_fallback(self) -> None:
@@ -154,21 +148,39 @@ extra_heavy_processes = ["my_solver", "sim_runner"]
     def test_effective_brightness_config_applies_state_overrides(self) -> None:
         base_cfg = copy.deepcopy(spc.DEFAULT_CONFIG)
         base_cfg["brightness"]["enabled"] = True
-        base_cfg["brightness"]["webcam_als_enabled"] = False
 
         # Null values defer to config.toml
         eff_defer = spc.effective_brightness_config(
-            base_cfg, {"enabled": True, "brightness_enabled": None, "webcam_als_enabled": None}
+            base_cfg, {"enabled": True, "brightness_enabled": None}
         )
         self.assertTrue(eff_defer["enabled"])
-        self.assertFalse(eff_defer["webcam_als_enabled"])
 
         # Boolean values override config.toml
         eff_override = spc.effective_brightness_config(
-            base_cfg, {"enabled": True, "brightness_enabled": False, "webcam_als_enabled": True}
+            base_cfg, {"enabled": True, "brightness_enabled": False}
         )
         self.assertFalse(eff_override["enabled"])
-        self.assertTrue(eff_override["webcam_als_enabled"])
+
+    def test_legacy_removed_brightness_keys_ignored_cleanly(self) -> None:
+        legacy_toml = """
+[brightness]
+enabled = true
+ambient_source = "auto"
+webcam_als_enabled = true
+webcam_device = "auto"
+webcam_interval_sec = 1800
+min_pct = 15
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_file = Path(tmp) / "legacy_v21.toml"
+            cfg_file.write_text(legacy_toml, encoding="utf-8")
+            loaded = spc.load_config(cfg_file)
+
+        self.assertEqual(loaded["brightness"]["min_pct"], 15)
+        self.assertEqual(
+            set(loaded["brightness"].keys()),
+            set(spc.DEFAULT_CONFIG["brightness"].keys()),
+        )
 
     def test_config_example_toml_matches_default_config_exact(self) -> None:
         example_path = REPO_ROOT / "config.example.toml"
@@ -197,7 +209,7 @@ extra_heavy_processes = ["my_solver", "sim_runner"]
 
 
 class TestAdaptiveBrightness(unittest.TestCase):
-    """Tests for circadian schedule, ambient mapping, clamping, override, and safe backlight."""
+    """Tests for pure circadian schedule, battery clamping, manual override, and safe backlight."""
 
     def test_circadian_schedule_interpolation_across_midnight(self) -> None:
         sched = spc.DEFAULT_CONFIG["brightness"]["schedule"]
@@ -218,68 +230,28 @@ class TestAdaptiveBrightness(unittest.TestCase):
         self.assertAlmostEqual(ab.interpolate_schedule(3.0, no_zero_sched), 35.0, places=3)
         self.assertAlmostEqual(ab.interpolate_schedule(21.0, no_zero_sched), 65.0, places=3)
 
-    def test_lux_to_brightness_pct_logarithmic_mapping(self) -> None:
-        self.assertAlmostEqual(ab.lux_to_brightness_pct(0.0, 12, 95), 12.0, places=2)
-        self.assertAlmostEqual(ab.lux_to_brightness_pct(-5.0, 12, 95), 12.0, places=2)
-        self.assertAlmostEqual(ab.lux_to_brightness_pct(float("nan"), 12, 95), 12.0, places=2)
-
-        p10 = ab.lux_to_brightness_pct(10.0, 12, 95)
-        p100 = ab.lux_to_brightness_pct(100.0, 12, 95)
-        p400 = ab.lux_to_brightness_pct(400.0, 12, 95)
-        p1500 = ab.lux_to_brightness_pct(1500.0, 12, 95)
-        p5000 = ab.lux_to_brightness_pct(5000.0, 12, 95)
-
-        self.assertGreaterEqual(p10, 20.0)
-        self.assertLessEqual(p10, 30.0)
-        self.assertGreaterEqual(p100, 48.0)
-        self.assertLessEqual(p100, 58.0)
-        self.assertGreaterEqual(p400, 70.0)
-        self.assertLessEqual(p400, 80.0)
-        self.assertAlmostEqual(p1500, 95.0, places=2)
-        self.assertAlmostEqual(p5000, 95.0, places=2)
-        self.assertTrue(12.0 < p10 < p100 < p400 < p1500)
-
-    def test_luma_to_brightness_pct_mapping(self) -> None:
-        self.assertAlmostEqual(ab.luma_to_brightness_pct(0.0, 12, 95), 12.0, places=2)
-        self.assertAlmostEqual(ab.luma_to_brightness_pct(-10.0, 12, 95), 12.0, places=2)
-        self.assertAlmostEqual(ab.luma_to_brightness_pct(255.0, 12, 95), 95.0, places=2)
-        self.assertAlmostEqual(ab.luma_to_brightness_pct(400.0, 12, 95), 95.0, places=2)
-
-        samples = [ab.luma_to_brightness_pct(v, 12, 95) for v in (0, 32, 64, 128, 192, 255)]
-        for a, b in zip(samples, samples[1:]):
-            self.assertLess(a, b)
-
-    def test_battery_multiplier_blend_and_min_max_clamping(self) -> None:
+    def test_battery_multiplier_and_min_max_clamping(self) -> None:
         # AC schedule-only
         self.assertEqual(
-            ab.compute_target_brightness(80.0, None, ac_online=True, battery_multiplier=0.85),
+            ab.compute_target_brightness(80.0, ac_online=True, battery_multiplier=0.85),
             80,
         )
         # Battery multiplier (80 * 0.85 = 68)
         self.assertEqual(
-            ab.compute_target_brightness(80.0, None, ac_online=False, battery_multiplier=0.85),
+            ab.compute_target_brightness(80.0, ac_online=False, battery_multiplier=0.85),
             68,
-        )
-        # Blend 70% ambient (90) + 30% schedule (30) = 72 on AC; 72 * 0.85 = 61.2 -> 61 on battery
-        self.assertEqual(
-            ab.compute_target_brightness(30.0, 90.0, ac_online=True, battery_multiplier=0.85),
-            72,
-        )
-        self.assertEqual(
-            ab.compute_target_brightness(30.0, 90.0, ac_online=False, battery_multiplier=0.85),
-            61,
         )
         # Lower clamp at min_pct
         self.assertEqual(
             ab.compute_target_brightness(
-                14.0, None, ac_online=False, battery_multiplier=0.85, min_pct=12, max_pct=95
+                14.0, ac_online=False, battery_multiplier=0.85, min_pct=12, max_pct=95
             ),
             12,
         )
         # Upper clamp at max_pct
         self.assertEqual(
             ab.compute_target_brightness(
-                100.0, 100.0, ac_online=True, battery_multiplier=0.85, min_pct=12, max_pct=95
+                100.0, ac_online=True, battery_multiplier=0.85, min_pct=12, max_pct=95
             ),
             95,
         )
@@ -291,8 +263,7 @@ class TestAdaptiveBrightness(unittest.TestCase):
         self.assertTrue(ab.detect_manual_override(46, 50))
 
         backend = FakeBacklightBackend(initial_pct=40)
-        als = FakeALSReader(lux=None)
-        ctrl = ab.AdaptiveBrightnessController(backend=backend, als_reader=als)
+        ctrl = ab.AdaptiveBrightnessController(backend=backend)
         cfg = copy.deepcopy(spc.DEFAULT_CONFIG["brightness"])
         cfg["smooth_step_pct"] = 5
         cfg["manual_override_pause_sec"] = 1800
@@ -304,6 +275,15 @@ class TestAdaptiveBrightness(unittest.TestCase):
         self.assertEqual(tel1["brightness_target_pct"], 78)
         self.assertEqual(tel1["brightness_source"], "Schedule")
         self.assertEqual(tel1["manual_override_until"], 0.0)
+        self.assertEqual(
+            set(tel1.keys()),
+            {
+                "brightness_pct",
+                "brightness_target_pct",
+                "brightness_source",
+                "manual_override_until",
+            },
+        )
 
         # User manually hits brightness Fn key down to 25% (delta=20 >= 4)
         backend.pct = 25
@@ -326,49 +306,14 @@ class TestAdaptiveBrightness(unittest.TestCase):
         self.assertEqual(tel4["manual_override_until"], 0.0)
         self.assertEqual(backend.pct, 30)
 
-        # Manual override again, then cleared immediately by force_measure=True
+        # Manual override again, then cleared immediately by force_apply=True
         backend.pct = 15
         ctrl.update(cfg, ac_online=True, now=t0 + 1810.0, local_hour=12.0)
         self.assertGreater(ctrl.manual_override_until, 0.0)
 
-        tel5 = ctrl.update(cfg, ac_online=True, now=t0 + 1815.0, local_hour=12.0, force_measure=True)
+        tel5 = ctrl.update(cfg, ac_online=True, now=t0 + 1815.0, local_hour=12.0, force_apply=True)
         self.assertEqual(tel5["manual_override_until"], 0.0)
         self.assertEqual(backend.pct, 20)
-
-    def test_should_sample_webcam_respects_ambient_source_even_on_force(self) -> None:
-        backend = FakeBacklightBackend(initial_pct=50)
-        als = FakeALSReader(lux=None)
-        ctrl = ab.AdaptiveBrightnessController(backend=backend, als_reader=als)
-
-        # Explicit schedule or als source must never fire webcam even when force=True
-        sched_cfg = copy.deepcopy(spc.DEFAULT_CONFIG["brightness"])
-        sched_cfg["ambient_source"] = "schedule"
-        self.assertFalse(ctrl.should_sample_webcam(sched_cfg, now=1000.0, force=True))
-
-        als_cfg = copy.deepcopy(spc.DEFAULT_CONFIG["brightness"])
-        als_cfg["ambient_source"] = "als"
-        self.assertFalse(ctrl.should_sample_webcam(als_cfg, now=1000.0, force=True))
-
-        # Auto source with webcam_als_enabled=False skips periodic, allows explicit force=True
-        auto_cfg = copy.deepcopy(spc.DEFAULT_CONFIG["brightness"])
-        auto_cfg["ambient_source"] = "auto"
-        auto_cfg["webcam_als_enabled"] = False
-        self.assertFalse(ctrl.should_sample_webcam(auto_cfg, now=1000.0, force=False))
-        self.assertTrue(ctrl.should_sample_webcam(auto_cfg, now=1000.0, force=True))
-
-        # Hardware ALS present suppresses webcam in auto mode even on force=True
-        self.assertFalse(
-            ctrl.should_sample_webcam(auto_cfg, daemon_als_lux=120.0, now=1000.0, force=True)
-        )
-
-        # Default config enables periodic webcam ALS on 30-minute (1800s) cadence
-        default_bcfg = ab.normalize_brightness_config(None)
-        self.assertTrue(default_bcfg["webcam_als_enabled"])
-        self.assertEqual(default_bcfg["webcam_interval_sec"], 1800)
-        self.assertTrue(ctrl.should_sample_webcam(default_bcfg, now=1000.0, force=False))
-        ctrl.ingest_webcam_luma(128.0, status="ok", now=1000.0)
-        self.assertFalse(ctrl.should_sample_webcam(default_bcfg, now=2000.0, force=False))
-        self.assertTrue(ctrl.should_sample_webcam(default_bcfg, now=2800.0, force=False))
 
     def test_select_safe_backlight_prefers_connected_igpu_and_rejects_nvidia(self) -> None:
         nvidia_unconnected = ab.BacklightEntry(
@@ -444,64 +389,6 @@ class TestAdaptiveBrightness(unittest.TestCase):
         )
         self.assertIsNotNone(dict_pick)
         self.assertEqual(dict_pick["name"], "intel_backlight")
-
-    @unittest.skipIf(sys.platform == "win32", "POSIX /proc/<pid>/fd symlink check")
-    def test_is_video_device_busy_detects_open_fd(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            proc_root = Path(tmp) / "proc"
-            fake_dev = Path(tmp) / "video0"
-            fake_dev.write_text("", encoding="utf-8")
-
-            # Another PID holding fake_dev open
-            fd_dir = proc_root / "999999" / "fd"
-            fd_dir.mkdir(parents=True)
-            os.symlink(str(fake_dev), fd_dir / "4")
-            self.assertTrue(ab.is_video_device_busy(str(fake_dev), proc_root=proc_root))
-
-            # Once closed, no longer busy
-            (fd_dir / "4").unlink()
-            self.assertFalse(ab.is_video_device_busy(str(fake_dev), proc_root=proc_root))
-
-    def test_webcam_warmup_frame_extraction_and_shutter_closed_fallback(self) -> None:
-        # 4 concatenated frames: frames 1..3 dark warmup (0), frame 4 exposed (120)
-        raw = bytes([0] * 100 + [0] * 100 + [5] * 100 + [120] * 100)
-        last = ab.extract_last_raw_frame(raw, frame_count=4)
-        self.assertEqual(len(last), 100)
-        luma, status = ab.analyze_webcam_frame(last)
-        self.assertEqual(status, "ok")
-        self.assertAlmostEqual(luma or 0.0, 120.0, places=2)
-
-        # Closed physical privacy shutter (all pixels 0 or <= 1) must be rejected
-        shutter_luma, shutter_status = ab.analyze_webcam_frame(bytes([0] * 19200))
-        self.assertIsNone(shutter_luma)
-        self.assertEqual(shutter_status, "webcam-shutter-closed")
-
-        shutter_luma_1, shutter_status_1 = ab.analyze_webcam_frame(bytes([1] * 100))
-        self.assertIsNone(shutter_luma_1)
-        self.assertEqual(shutter_status_1, "webcam-shutter-closed")
-
-        # Isolated hot-pixel noise on a closed shutter (mean < 0.5, max <= 4) also rejected
-        hot_pixel_frame = bytes([0] * 999 + [3])
-        hp_luma, hp_status = ab.analyze_webcam_frame(hot_pixel_frame)
-        self.assertIsNone(hp_luma)
-        self.assertEqual(hp_status, "webcam-shutter-closed")
-
-        # Controller clears cached webcam luma on shutter-closed and falls back to Schedule
-        backend = FakeBacklightBackend(initial_pct=50)
-        als = FakeALSReader(lux=None)
-        ctrl = ab.AdaptiveBrightnessController(backend=backend, als_reader=als)
-        cfg = copy.deepcopy(spc.DEFAULT_CONFIG["brightness"])
-
-        ctrl.ingest_webcam_luma(200.0, status="ok", now=1000.0)
-        tel_cam = ctrl.update(cfg, ac_online=True, now=1001.0, local_hour=12.0)
-        self.assertEqual(tel_cam["brightness_source"], "Webcam")
-
-        ctrl.ingest_webcam_luma(None, status="webcam-shutter-closed", now=2000.0)
-        self.assertIsNone(ctrl.cached_webcam_luma)
-        self.assertIsNone(ctrl.last_ambient_luma)
-        tel_sched = ctrl.update(cfg, ac_online=True, now=2001.0, local_hour=12.0)
-        self.assertEqual(tel_sched["brightness_source"], "Schedule")
-        self.assertEqual(tel_sched["brightness_target_pct"], 78)
 
 
 class TestDisplayRefresh(unittest.TestCase):
@@ -1078,9 +965,6 @@ class TestCrossWorkerContracts(unittest.TestCase):
                 "brightness-on",
                 "brightness-off",
                 "brightness-toggle",
-                "webcam-als-on",
-                "webcam-als-off",
-                "webcam-als-toggle",
             },
         )
 
@@ -1096,11 +980,10 @@ class TestCrossWorkerContracts(unittest.TestCase):
                 smart_powerctl.resolve_control_command(["brightness", sub]),
                 f"brightness-{sub}",
             )
-            self.assertEqual(
-                smart_powerctl.resolve_control_command(["webcam-als", sub]),
-                f"webcam-als-{sub}",
-            )
+        # Removed camera commands & arbitrary flags must be rejected
         self.assertIsNone(smart_powerctl.resolve_control_command(["--arbitrary-flag"]))
+        self.assertIsNone(smart_powerctl.resolve_control_command(["measure-light"]))
+        self.assertIsNone(smart_powerctl.resolve_control_command(["webcam-als", "on"]))
 
         # 3. smart-powerd.sudoers template
         sudoers_text = (REPO_ROOT / "smart-powerd.sudoers").read_text(encoding="utf-8")
@@ -1117,13 +1000,13 @@ class TestCrossWorkerContracts(unittest.TestCase):
         install_cmds = set(match.group(1).split())
         self.assertEqual(install_cmds, expected)
 
-        # 5. smart-powerd.py handle_command accepts all 10 and rejects unknown
+        # 5. smart-powerd.py handle_command accepts all 7 and rejects unknown/removed
         d = smart_powerd.SmartPowerDaemon.__new__(smart_powerd.SmartPowerDaemon)
         d.enabled = True
         d.current_mode = "light"
         d.current_reason = "idle"
         d.config = copy.deepcopy(spc.DEFAULT_CONFIG)
-        d.state = {"enabled": True, "brightness_enabled": None, "webcam_als_enabled": None}
+        d.state = {"enabled": True, "brightness_enabled": None}
         d.last_mode_activity_ts = {}
         d.last_download_pids = []
         d.last_heavy_pids = []
@@ -1144,8 +1027,42 @@ class TestCrossWorkerContracts(unittest.TestCase):
             resp = d.handle_command(cmd)
             self.assertTrue(resp.get("ok"), f"Daemon rejected valid command '{cmd}': {resp}")
 
-        bad_resp = d.handle_command("rm -rf /")
-        self.assertFalse(bad_resp.get("ok"))
+        for bad_cmd in ("rm -rf /", "webcam-als-on", "webcam-als-toggle", "measure-light"):
+            bad_resp = d.handle_command(bad_cmd)
+            self.assertFalse(bad_resp.get("ok"), f"Daemon should reject '{bad_cmd}'")
+
+    def test_zero_camera_webcam_or_als_references_in_production_files(self) -> None:
+        forbidden_re = re.compile(
+            r"\b(?:ffmpeg|v4l2|dshow|webcam|webcam-als|webcam_als|measure-light|"
+            r"als_lux|ambient_lux|ambient_luma|SensorProxy|in_illuminance|"
+            r"video4linux|LightSensor)\b",
+            re.IGNORECASE,
+        )
+        prod_files: list[Path] = []
+        for pattern in (
+            "*.py",
+            "*.sh",
+            "*.toml",
+            "*.service",
+            "*.rules",
+            "*.types",
+            "*.desktop",
+            "smart-powerd.sudoers",
+            "windows/*.py",
+            "windows/*.ps1",
+            "scripts/*.sh",
+            ".github/workflows/*.yml",
+        ):
+            prod_files.extend(REPO_ROOT.glob(pattern))
+
+        hits: list[str] = []
+        for path in sorted(set(prod_files)):
+            txt = path.read_text(encoding="utf-8", errors="ignore")
+            for idx, line in enumerate(txt.splitlines(), 1):
+                if forbidden_re.search(line):
+                    hits.append(f"{path.relative_to(REPO_ROOT)}:{idx}: {line.strip()}")
+
+        self.assertEqual(hits, [], f"Forbidden camera/sensor references found:\n" + "\n".join(hits))
 
     @unittest.skipIf(sys.platform == "win32", "POSIX bash syntax check")
     def test_shell_scripts_syntax_valid(self) -> None:

@@ -3,7 +3,7 @@
     Uninstalls smart-powerd for Windows 10/11 and restores baseline power & display settings.
 
 .DESCRIPTION
-    - Stops any running smart_power_win.py process.
+    - Stops any running smart-powerd.exe or smart_power_win.py process.
     - Removes the Windows logon autostart entry (HKCU Run and any Startup shortcut).
     - Restores Balanced power overlay, baseline Wi-Fi Power Saving / PCIe ASPM / USB Selective
       Suspend settings from baseline.json, and native highest display refresh rate.
@@ -59,19 +59,37 @@ public static class SmartPowerWin32Restore {
 }
 
 Write-Host "==> Stopping running smart-powerd processes..." -ForegroundColor Cyan
+$StoppedAny = $false
 try {
-    $procs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*smart_power_win.py*" }
-    foreach ($p in $procs) {
-        Write-Host "    Stopping PID $($p.ProcessId)..."
-        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    if ($procs) {
-        Start-Sleep -Milliseconds 500
+    $exeProcs = Get-Process -Name "smart-powerd" -ErrorAction SilentlyContinue
+    foreach ($ep in $exeProcs) {
+        Write-Host "    Stopping smart-powerd.exe (PID $($ep.Id))..."
+        Stop-Process -Id $ep.Id -Force -ErrorAction SilentlyContinue
+        $StoppedAny = $true
     }
 }
 catch {
     # Non-fatal
+}
+
+try {
+    $procs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($_.Name -eq "smart-powerd.exe") -or
+            ($_.CommandLine -and $_.CommandLine -like "*smart_power_win.py*")
+        }
+    foreach ($p in $procs) {
+        Write-Host "    Stopping PID $($p.ProcessId)..."
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        $StoppedAny = $true
+    }
+}
+catch {
+    # Non-fatal
+}
+
+if ($StoppedAny) {
+    Start-Sleep -Milliseconds 600
 }
 
 Write-Host "==> Removing Windows logon autostart..." -ForegroundColor Cyan
@@ -91,11 +109,24 @@ if (Test-Path -LiteralPath $StartupShortcut) {
 }
 
 Write-Host "==> Restoring Balanced overlay, baseline power settings, and native refresh rate..." -ForegroundColor Cyan
+$TargetExe = Join-Path $InstallDir "smart-powerd.exe"
 $TargetScript = Join-Path $InstallDir "smart_power_win.py"
 $VenvPython = Join-Path $InstallDir ".venv\Scripts\python.exe"
-$RestoredByPython = $false
+$RestoredByApp = $false
 
-if (Test-Path -LiteralPath $TargetScript) {
+if (Test-Path -LiteralPath $TargetExe) {
+    try {
+        $null = (& $TargetExe --restore | Out-String)
+        if ($LASTEXITCODE -eq 0) {
+            $RestoredByApp = $true
+        }
+    }
+    catch {
+        # Fall through to script/PowerShell restore
+    }
+}
+
+if (-not $RestoredByApp -and (Test-Path -LiteralPath $TargetScript)) {
     $pyCandidates = @()
     if (Test-Path -LiteralPath $VenvPython) {
         $pyCandidates += $VenvPython
@@ -108,7 +139,7 @@ if (Test-Path -LiteralPath $TargetScript) {
         try {
             & $py $TargetScript --restore 2>$null
             if ($LASTEXITCODE -eq 0) {
-                $RestoredByPython = $true
+                $RestoredByApp = $true
                 break
             }
         }
@@ -118,7 +149,7 @@ if (Test-Path -LiteralPath $TargetScript) {
     }
 }
 
-# Guaranteed native PowerShell restoration fallback (even if Python/venv is absent)
+# Guaranteed native PowerShell restoration fallback (even if binary/Python is absent)
 $BaselinePath = Join-Path $InstallDir "baseline.json"
 $WifiAc = 0; $WifiDc = 0
 $PcieAc = 1; $PcieDc = 1
@@ -145,7 +176,7 @@ if (Test-Path -LiteralPath $BaselinePath) {
     }
 }
 
-if (-not $RestoredByPython) {
+if (-not $RestoredByApp) {
     Restore-PowerOverlayBalanced
     & powercfg /setacvalueindex SCHEME_CURRENT $SUBGROUP_WIFI $SETTING_WIFI_PS $WifiAc 2>$null | Out-Null
     & powercfg /setdcvalueindex SCHEME_CURRENT $SUBGROUP_WIFI $SETTING_WIFI_PS $WifiDc 2>$null | Out-Null
@@ -167,6 +198,7 @@ if (Test-Path -LiteralPath $InstallDir) {
         $HasUserConfig = Test-Path -LiteralPath $ConfigPath
 
         $ItemsToRemove = @(
+            "smart-powerd.exe",
             "smart_power_win.py",
             "smart_power_config.py",
             "adaptive_brightness.py",

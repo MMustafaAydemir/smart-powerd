@@ -140,7 +140,7 @@ fi
 # Informational optional dependency report
 OPT_PRESENT=()
 OPT_MISSING=()
-for opt_cmd in kscreen-doctor wlr-randr gdctl gnome-randr xrandr brightnessctl ffmpeg; do
+for opt_cmd in kscreen-doctor wlr-randr gdctl gnome-randr xrandr brightnessctl; do
   if find_bin "${opt_cmd}" >/dev/null 2>&1; then
     OPT_PRESENT+=("${opt_cmd}")
   else
@@ -253,9 +253,6 @@ HELPER_CMDS=(
   brightness-on
   brightness-off
   brightness-toggle
-  webcam-als-on
-  webcam-als-off
-  webcam-als-toggle
 )
 
 ADMIN_GROUPS=()
