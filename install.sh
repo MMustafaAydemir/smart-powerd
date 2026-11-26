@@ -253,6 +253,9 @@ HELPER_CMDS=(
   brightness-on
   brightness-off
   brightness-toggle
+  charge-limit-on
+  charge-limit-off
+  charge-limit-toggle
 )
 
 ADMIN_GROUPS=()
@@ -302,8 +305,8 @@ BACKUP_DIR="/var/lib/smart-powerd/backups/${TIMESTAMP}"
 mkdir -p "${BACKUP_DIR}" /var/lib/smart-powerd /run/smart-powerd
 
 BASELINE_FILE="/var/lib/smart-powerd/baseline.json"
-if [[ ! -f "${BASELINE_FILE}" ]]; then
-  "${PYTHON_BIN}" - "${BASELINE_FILE}" "${IW_BIN}" <<'PYEOF'
+"${PYTHON_BIN}" - "${BASELINE_FILE}" "${IW_BIN}" <<'PYEOF'
+import glob
 import json
 import shutil
 import subprocess
@@ -320,6 +323,116 @@ def read_text(path: Path, default: str | None = None) -> str | None:
     except OSError:
         return default
 
+
+def capture_charge_limit_baseline() -> dict[str, str | None] | None:
+    bat_dir: Path | None = None
+    ps_root = Path("/sys/class/power_supply")
+    if ps_root.is_dir():
+        candidates = sorted(ps_root.iterdir(), key=lambda p: (not p.name.startswith("BAT"), p.name))
+        for entry in candidates:
+            if (read_text(entry / "type", "") or "").lower() == "battery":
+                bat_dir = entry
+                break
+
+    if bat_dir is not None:
+        end_p = bat_dir / "charge_control_end_threshold"
+        if end_p.is_file():
+            val = read_text(end_p)
+            if val is not None:
+                start_p = bat_dir / "charge_control_start_threshold"
+                s_val = read_text(start_p) if start_p.is_file() else None
+                return {
+                    "backend": "charge_control_end_threshold",
+                    "path": str(end_p),
+                    "value": val,
+                    "start_path": str(start_p) if s_val is not None else None,
+                    "start_value": s_val,
+                }
+
+        stop_p = bat_dir / "charge_stop_threshold"
+        if stop_p.is_file():
+            val = read_text(stop_p)
+            if val is not None:
+                start_p = bat_dir / "charge_start_threshold"
+                s_val = read_text(start_p) if start_p.is_file() else None
+                return {
+                    "backend": "charge_stop_threshold",
+                    "path": str(stop_p),
+                    "value": val,
+                    "start_path": str(start_p) if s_val is not None else None,
+                    "start_value": s_val,
+                }
+
+        ct_p = bat_dir / "charge_types"
+        if ct_p.is_file():
+            raw_ct = read_text(ct_p, "") or ""
+            tokens = [t.strip("[]") for t in raw_ct.split() if t.strip("[]")]
+            if "Long_Life" in tokens and "Standard" in tokens:
+                active = None
+                for tok in raw_ct.split():
+                    if tok.startswith("[") and tok.endswith("]"):
+                        active = tok[1:-1]
+                        break
+                if active is None and tokens:
+                    active = tokens[0]
+                return {
+                    "backend": "charge_types",
+                    "path": str(ct_p),
+                    "value": active,
+                    "start_path": None,
+                    "start_value": None,
+                }
+
+    for cm in sorted(glob.glob("/sys/bus/platform/drivers/ideapad_acpi/*/conservation_mode")):
+        cm_p = Path(cm)
+        val = read_text(cm_p)
+        if val is not None:
+            return {
+                "backend": "conservation_mode",
+                "path": str(cm_p),
+                "value": val,
+                "start_path": None,
+                "start_value": None,
+            }
+
+    lg_p = Path("/sys/devices/platform/lg-laptop/battery_care_limit")
+    if lg_p.is_file():
+        val = read_text(lg_p)
+        if val is not None:
+            return {
+                "backend": "battery_care_limit",
+                "path": str(lg_p),
+                "value": val,
+                "start_path": None,
+                "start_value": None,
+            }
+
+    sam_p = Path("/sys/devices/platform/samsung/battery_life_extender")
+    if sam_p.is_file():
+        val = read_text(sam_p)
+        if val is not None:
+            return {
+                "backend": "battery_life_extender",
+                "path": str(sam_p),
+                "value": val,
+                "start_path": None,
+                "start_value": None,
+            }
+
+    return None
+
+
+if baseline_path.is_file():
+    try:
+        existing = json.loads(baseline_path.read_text(encoding="utf-8", errors="ignore"))
+    except ValueError:
+        existing = None
+    if isinstance(existing, dict):
+        if "charge_limit_baseline" not in existing:
+            existing["charge_limit_baseline"] = capture_charge_limit_baseline()
+            baseline_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+            baseline_path.chmod(0o644)
+        sys.exit(0)
 
 aspm = "default"
 raw_aspm = read_text(Path("/sys/module/pcie_aspm/parameters/policy"), "") or ""
@@ -421,11 +534,11 @@ data = {
     "kbd_backlight": kbd_backlight,
     "pci_controls": pci_controls,
     "usb_controls": usb_controls,
+    "charge_limit_baseline": capture_charge_limit_baseline(),
 }
 baseline_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 baseline_path.chmod(0o644)
 PYEOF
-fi
 
 # ---------------------------------------------------------------------------
 # Back up existing installed files

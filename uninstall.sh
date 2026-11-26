@@ -8,9 +8,9 @@ usage() {
   cat <<'EOF'
 Usage: sudo smart-power-uninstall [OPTIONS]
 
-Stop smart-powerd and smart-power-tray, restore captured hardware defaults,
-and remove installed files. Never modifies battery charge thresholds or
-desktop environment power settings.
+Stop smart-powerd and smart-power-tray, restore captured hardware defaults
+(including original battery charge-limit settings), and remove installed
+files. Never modifies desktop environment power settings.
 
 Options:
   --user <name>   Desktop user whose tray & autostart entry should be removed
@@ -156,8 +156,8 @@ fi
 
 # ---------------------------------------------------------------------------
 # Restore all captured hardware baseline settings before removing state dir
-# (Never wakes suspended discrete GPUs; never touches battery charge limits
-# or desktop environment power settings.)
+# (Never wakes suspended discrete GPUs; restores original battery charge
+# limit baseline; never touches desktop environment power settings.)
 # ---------------------------------------------------------------------------
 if [[ -n "${PYTHON_BIN}" && -x "${PYTHON_BIN}" ]]; then
   "${PYTHON_BIN}" - "${IW_BIN}" <<'PYEOF'
@@ -332,6 +332,20 @@ usb_controls = baseline.get("usb_controls", {})
 if isinstance(usb_controls, dict):
     for dev_id, ctrl in usb_controls.items():
         write_text(f"/sys/bus/usb/devices/{dev_id}/power/control", str(ctrl))
+
+# 11. Restore original battery charge-limit baseline (end -> start -> end order)
+cl_base = baseline.get("charge_limit_baseline")
+if isinstance(cl_base, dict):
+    c_path = cl_base.get("path")
+    c_val = cl_base.get("value")
+    s_path = cl_base.get("start_path")
+    s_val = cl_base.get("start_value")
+    if isinstance(c_path, str) and c_path and c_val is not None:
+        write_text(c_path, str(c_val))
+    if isinstance(s_path, str) and s_path and s_val is not None:
+        write_text(s_path, str(s_val))
+        if isinstance(c_path, str) and c_path and c_val is not None:
+            write_text(c_path, str(c_val))
 PYEOF
 fi
 

@@ -4,7 +4,8 @@ smart-power-tray: Lightweight PyQt6 system tray controller for smart-powerd.
 
 Runs inside the user's graphical session (Wayland or X11) to coordinate:
   - Passwordless Smart Optimize toggle (left-click & right-click menu)
-  - Live telemetry tooltip & menu (mode, trigger, battery wattage, EPP, Wi-Fi PS, dGPU)
+  - Live battery percentage tray badge + 80% hardware charge-limit control & fallback alert
+  - Live telemetry tooltip & menu (mode, trigger, battery wattage, charge limit, EPP, Wi-Fi PS, dGPU)
   - Portable dGPU-safe day/night circadian adaptive brightness
   - Multi-DE 3-tier laptop display refresh rate switching (AC max Hz, Battery mid Hz, Low Battery 60 Hz)
   - Per-user QLocalServer single-instance lock & refresh IPC
@@ -29,8 +30,8 @@ if str(_SCRIPT_DIR) not in sys.path:
 if str(_LIB_DIR) not in sys.path:
     sys.path.append(str(_LIB_DIR))
 
-from PyQt6.QtCore import QPointF, QProcess, QSocketNotifier, Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
+from PyQt6.QtCore import QPointF, QProcess, QRectF, QSocketNotifier, Qt, QTimer
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
@@ -48,6 +49,7 @@ from display_refresh import DisplayRefreshController
 STATUS_FILE = Path("/run/smart-powerd/status.json")
 CTL_BIN = "/usr/local/bin/smart-powerctl"
 POLL_MS = 2500
+ICON_CACHE_MAX = 64
 
 MODE_COLORS = {
     "light": "#2ecc71",     # Emerald green
@@ -132,12 +134,30 @@ def load_local_config() -> dict[str, Any]:
             "low_battery_refresh_pct": 20,
             "low_refresh_hz": 60,
         },
+        "battery_charge": {
+            "limit_enabled": True,
+            "stop_threshold": 80,
+            "start_threshold": 75,
+            "notify_when_no_hw_limit": True,
+        },
         "brightness": normalize_brightness_config(None),
     }
 
 
-def render_tray_icon(mode: str, enabled: bool) -> QIcon:
-    """Render a crisp 64x64 vector badge icon directly with QPainter."""
+def render_tray_icon(
+    mode: str,
+    enabled: bool,
+    battery_pct: int | None = None,
+    charging: bool = False,
+) -> QIcon:
+    """
+    Render a crisp 64x64 tray badge icon directly with QPainter.
+
+    When ``battery_pct`` is provided, renders a high-contrast mode-colored rounded
+    badge displaying the bold battery percentage number (plus a bright charging
+    accent bar when ``charging=True``). Falls back to the vector bolt/arrow/off
+    circle badge when no battery is present or the daemon is offline.
+    """
     key = mode if enabled else "off"
     bg_hex = MODE_COLORS.get(key, MODE_COLORS["off"])
 
@@ -146,8 +166,46 @@ def render_tray_icon(mode: str, enabled: bool) -> QIcon:
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-    # Outer badge circle
+    if battery_pct is not None:
+        pct_val = max(0, min(100, int(round(battery_pct))))
+        badge_rect = QRectF(3.0, 3.0, 58.0, 58.0)
+
+        painter.setPen(QPen(QColor("#1c242b"), 3.0))
+        painter.setBrush(QColor(bg_hex))
+        painter.drawRoundedRect(badge_rect, 14.0, 14.0)
+
+        font = QFont("Sans Serif")
+        font.setStyleHint(QFont.StyleHint.SansSerif)
+        font.setBold(True)
+        font.setWeight(QFont.Weight.ExtraBold)
+        font.setPixelSize(25 if pct_val >= 100 else 35)
+        painter.setFont(font)
+
+        text = str(pct_val)
+        text_rect = QRectF(3.0, 2.0, 58.0, 48.0) if charging else QRectF(3.0, 3.0, 58.0, 58.0)
+
+        # Subtle dark drop shadow for sharp legibility at 22px panel scale
+        painter.setPen(QColor(0, 0, 0, 155))
+        painter.drawText(
+            text_rect.translated(1.2, 1.8),
+            int(Qt.AlignmentFlag.AlignCenter),
+            text,
+        )
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), text)
+
+        if charging:
+            # High-contrast golden charging indicator bar along bottom edge
+            painter.setPen(QPen(QColor("#1c242b"), 1.6))
+            painter.setBrush(QColor("#ffe066"))
+            painter.drawRoundedRect(QRectF(14.0, 50.0, 36.0, 6.5), 3.0, 3.0)
+
+        painter.end()
+        return QIcon(pixmap)
+
+    # Fallback vector circle badge (no battery / daemon offline)
     painter.setPen(QPen(QColor("#1c242b"), 3.0))
     painter.setBrush(QColor(bg_hex))
     painter.drawEllipse(4, 4, 56, 56)
@@ -225,6 +283,38 @@ def _truncate(text: str, max_len: int = 52) -> str:
     return clean[: max_len - 1] + "…"
 
 
+def evaluate_charge_limit_alert(
+    st: dict[str, Any],
+    already_sent: bool,
+) -> tuple[bool, bool]:
+    """
+    Evaluate once-per-charge-cycle alert-only notification state when no hardware
+    EC charge cutoff is available. Returns ``(should_fire_now, next_already_sent)``.
+    """
+    bat_present = bool(st.get("battery_present", True))
+    ac_online = SmartPowerTray._is_ac_online(st)
+    bat_status = str(st.get("battery_status", "")).strip().lower()
+    bat_pct = int(round(float(st.get("battery_pct", 0) or 0)))
+    limit_on = bool(st.get("charge_limit_enabled", True))
+    limit_pct = int(st.get("charge_limit_pct", 80) or 80)
+    hw_sup = bool(st.get("charge_limit_hw_supported", False))
+    notify_fb = bool(st.get("charge_limit_notify_fallback", True))
+
+    if not bat_present or not ac_online or not limit_on or bat_pct < (limit_pct - 2):
+        return False, False
+
+    if (
+        not already_sent
+        and not hw_sup
+        and notify_fb
+        and bat_status == "charging"
+        and bat_pct >= limit_pct
+    ):
+        return True, True
+
+    return False, already_sent
+
+
 class SmartPowerTray:
     """System tray controller integrating daemon status, circadian brightness, and refresh rate."""
 
@@ -234,10 +324,11 @@ class SmartPowerTray:
         self._active_procs: list[QProcess] = []
         self._cleaned_up = False
 
-        self.icon_cache: dict[str, QIcon] = {}
-        self.last_icon_key: str | None = None
+        self.icon_cache: dict[tuple[str, int | None, bool], QIcon] = {}
+        self.last_icon_key: tuple[str, int | None, bool] | None = None
         self.last_enabled: bool = True
         self.last_status: dict[str, Any] | None = None
+        self._charge_alert_sent: bool = False
         self._last_telemetry_written: dict[str, Any] | None = None
         self._local_config: dict[str, Any] = load_local_config()
         self._telemetry_path = get_display_telemetry_path()
@@ -252,7 +343,8 @@ class SmartPowerTray:
         self.menu = QMenu()
         self.act_state = self._make_info_action("Smart Optimize: Loading...")
         self.act_reason = self._make_info_action("Trigger: --")
-        self.act_watt = self._make_info_action("Battery: -- W")
+        self.act_watt = self._make_info_action("Battery: --")
+        self.act_charge_limit = self._make_info_action("Charge Limit: --")
         self.act_cpu = self._make_info_action("CPU EPP: -- | Wi-Fi PS: --")
         self.act_dgpu = self._make_info_action("dGPU: --")
         self.act_refresh = self._make_info_action("Refresh: --")
@@ -262,6 +354,7 @@ class SmartPowerTray:
             self.act_state,
             self.act_reason,
             self.act_watt,
+            self.act_charge_limit,
             self.act_cpu,
             self.act_dgpu,
             self.act_refresh,
@@ -274,6 +367,10 @@ class SmartPowerTray:
         self.act_toggle = QAction("Turn Smart Optimize OFF", self.menu)
         self.act_toggle.triggered.connect(self.trigger_toggle)
         self.menu.addAction(self.act_toggle)
+
+        self.act_charge_limit_toggle = QAction("80% Charge Limit: ON", self.menu)
+        self.act_charge_limit_toggle.triggered.connect(self.trigger_charge_limit_toggle)
+        self.menu.addAction(self.act_charge_limit_toggle)
 
         self.act_brightness_toggle = QAction("Auto Brightness: ON", self.menu)
         self.act_brightness_toggle.triggered.connect(self.trigger_brightness_toggle)
@@ -308,11 +405,26 @@ class SmartPowerTray:
         act.setEnabled(False)
         return act
 
-    def _get_icon(self, mode: str, enabled: bool) -> QIcon:
-        key = mode if enabled else "off"
-        if key not in self.icon_cache:
-            self.icon_cache[key] = render_tray_icon(mode, enabled)
-        return self.icon_cache[key]
+    def _get_icon(
+        self,
+        mode: str,
+        enabled: bool,
+        battery_pct: int | None = None,
+        charging: bool = False,
+    ) -> QIcon:
+        icon_mode = mode if enabled else "off"
+        norm_pct = max(0, min(100, int(round(battery_pct)))) if battery_pct is not None else None
+        cache_key = (icon_mode, norm_pct, bool(charging) if norm_pct is not None else False)
+        if cache_key not in self.icon_cache:
+            if len(self.icon_cache) >= ICON_CACHE_MAX:
+                self.icon_cache.pop(next(iter(self.icon_cache)))
+            self.icon_cache[cache_key] = render_tray_icon(
+                mode,
+                enabled,
+                battery_pct=norm_pct,
+                charging=cache_key[2],
+            )
+        return self.icon_cache[cache_key]
 
     @staticmethod
     def _read_status() -> dict[str, Any] | None:
@@ -461,6 +573,38 @@ class SmartPowerTray:
             tier_label = "AC" if ac_online else "Battery"
         return f"{cur_str} ({tier_label})"
 
+    @staticmethod
+    def _format_battery_summary(st: dict[str, Any]) -> str:
+        if not st.get("battery_present", True):
+            return "No battery"
+        pct = int(round(float(st.get("battery_pct", 0) or 0)))
+        watts = float(st.get("battery_watts", 0.0) or 0.0)
+        status_raw = str(st.get("battery_status", "Unknown")).strip() or "Unknown"
+        status_label = status_raw[:1].upper() + status_raw[1:]
+        return f"{pct}% — {status_label} ({watts:.1f} W)"
+
+    @staticmethod
+    def _format_charge_limit_summary(st: dict[str, Any]) -> str:
+        if not st.get("battery_present", True):
+            return "No battery"
+        limit_on = bool(st.get("charge_limit_enabled", True))
+        limit_pct = int(st.get("charge_limit_pct", 80) or 80)
+        hw_sup = bool(st.get("charge_limit_hw_supported", False))
+        active_val = st.get("charge_limit_active_value")
+
+        if not limit_on:
+            return "OFF (100%)"
+        if hw_sup:
+            val_str = str(active_val).strip() if active_val is not None else ""
+            if (
+                val_str
+                and not val_str.isdigit()
+                and val_str not in (f"{limit_pct}%", str(limit_pct))
+            ):
+                return f"{limit_pct}% (ON — {val_str})"
+            return f"{limit_pct}% (ON — Hardware)"
+        return f"{limit_pct}% (Alert Only)"
+
     def _update_ui_and_telemetry(
         self,
         st: dict[str, Any] | None,
@@ -478,10 +622,10 @@ class SmartPowerTray:
         )
 
         if not st:
-            icon = self._get_icon("off", False)
-            if self.last_icon_key != "offline":
-                self.tray.setIcon(icon)
-                self.last_icon_key = "offline"
+            offline_key = ("offline", None, False)
+            if self.last_icon_key != offline_key:
+                self.tray.setIcon(self._get_icon("off", False, battery_pct=None, charging=False))
+                self.last_icon_key = offline_key
             tooltip = (
                 "Smart Power: Daemon offline\n"
                 f"Refresh: {refresh_summary}\n"
@@ -491,15 +635,31 @@ class SmartPowerTray:
             self.act_state.setText("Smart Optimize: Daemon offline")
             self.act_reason.setText("Trigger: unavailable")
             self.act_watt.setText("Battery: unavailable")
+            self.act_charge_limit.setText("Charge Limit: unavailable")
             self.act_cpu.setText("CPU EPP: -- | Wi-Fi PS: --")
             self.act_dgpu.setText("dGPU: --")
             return
 
         enabled = bool(st.get("enabled", True))
         mode = str(st.get("mode", "light" if enabled else "off"))
-        icon_key = mode if enabled else "off"
+        icon_mode = mode if enabled else "off"
+
+        bat_present = bool(st.get("battery_present", True))
+        bat_status_raw = str(st.get("battery_status", "Unknown")).strip()
+        bat_pct: int | None = None
+        charging = False
+        if bat_present and st.get("battery_pct") is not None:
+            try:
+                bat_pct = max(0, min(100, int(round(float(st.get("battery_pct", 0))))))
+            except (TypeError, ValueError):
+                bat_pct = None
+            charging = bat_status_raw.lower() == "charging"
+
+        icon_key = (icon_mode, bat_pct, charging if bat_pct is not None else False)
         if icon_key != self.last_icon_key:
-            self.tray.setIcon(self._get_icon(mode, enabled))
+            self.tray.setIcon(
+                self._get_icon(mode, enabled, battery_pct=bat_pct, charging=charging)
+            )
             self.last_icon_key = icon_key
 
         self.last_enabled = enabled
@@ -517,18 +677,30 @@ class SmartPowerTray:
         else:
             dgpu_line = f"{dgpu_status} ({dgpu_state})"
 
-        if st.get("battery_present", True):
-            watts = float(st.get("battery_watts", 0.0) or 0.0)
-            bat_status = str(st.get("battery_status", "Unknown")).lower()
-            bat_pct = st.get("battery_pct", 0)
-            bat_line = f"{watts:.2f} W {bat_status} ({bat_pct}%)"
-        else:
-            bat_line = "No battery"
+        bat_line = self._format_battery_summary(st)
+        charge_limit_line = self._format_charge_limit_summary(st)
+        limit_on = bool(st.get("charge_limit_enabled", True))
+        limit_pct = int(st.get("charge_limit_pct", 80) or 80)
+
+        # Once-per-charge-cycle fallback alert when laptop lacks hardware EC charge cutoff
+        should_fire, self._charge_alert_sent = evaluate_charge_limit_alert(
+            st, self._charge_alert_sent
+        )
+        if should_fire:
+            pct_disp = bat_pct if bat_pct is not None else limit_pct
+            self.tray.showMessage(
+                f"Battery reached {limit_pct}%",
+                f"Battery is at {pct_disp}% while charging. Unplug the charger to preserve "
+                "long-term battery health (no hardware charge cutoff detected).",
+                QSystemTrayIcon.MessageIcon.Information,
+                8000,
+            )
 
         tooltip = (
             f"Smart Optimize: {toggle_label} | Mode: {mode_label}\n"
             f"Trigger: {reason}\n"
             f"Battery: {bat_line}\n"
+            f"Charge Limit: {charge_limit_line}\n"
             f"CPU EPP: {epp} | Wi-Fi PS: {wifi_ps}\n"
             f"dGPU: {dgpu_line}\n"
             f"Refresh: {refresh_summary}\n"
@@ -539,11 +711,16 @@ class SmartPowerTray:
         self.act_state.setText(f"Smart Optimize: {toggle_label} ({mode_label})")
         self.act_reason.setText(f"Trigger: {_truncate(reason or '--')}")
         self.act_watt.setText(f"Battery: {bat_line}")
+        self.act_charge_limit.setText(f"Charge Limit: {charge_limit_line}")
         self.act_cpu.setText(f"CPU EPP: {epp} | Wi-Fi PS: {wifi_ps}")
         self.act_dgpu.setText(f"dGPU: {dgpu_line}")
         self.act_toggle.setText(
             "Turn Smart Optimize OFF" if enabled else "Turn Smart Optimize ON"
         )
+        self.act_charge_limit_toggle.setText(
+            f"{limit_pct}% Charge Limit: {'ON' if limit_on else 'OFF'}"
+        )
+        self.act_charge_limit_toggle.setEnabled(bat_present)
 
     def refresh_status(self, force_probe: bool = False) -> None:
         now = time.time()
@@ -590,6 +767,10 @@ class SmartPowerTray:
 
     def trigger_toggle(self) -> None:
         self._run_ctl(["toggle"])
+
+    def trigger_charge_limit_toggle(self) -> None:
+        self._charge_alert_sent = False
+        self._run_ctl(["charge-limit", "toggle"])
 
     def trigger_brightness_toggle(self) -> None:
         self.brightness_ctrl.clear_manual_override()

@@ -103,6 +103,27 @@ low_battery_refresh_pct = 20
 low_refresh_hz = 60
 
 
+[battery_charge]
+# Enforce a hardware battery charge limit (default 80%) to protect long-term
+# battery health. Runs independently of Smart Optimize ON/OFF and can be
+# toggled live via tray menu or `smart-powerctl charge-limit on|off|toggle`.
+limit_enabled = true
+
+# Stop charging threshold percentage (clamped 50..100).
+# On hardware backends with fixed charge modes (e.g. Uniwill/TongFang
+# `Long_Life`, Lenovo `conservation_mode`), enabled when limit_enabled = true
+# and stop_threshold <= 85.
+stop_threshold = 80
+
+# Start charging threshold percentage (clamped 40..95, always <= stop_threshold - 5)
+# on laptops whose kernel driver exposes a start-charge threshold.
+start_threshold = 75
+
+# On laptops without a hardware EC charge-limit interface (including Windows),
+# show a once-per-charge-cycle tray notification when charging reaches stop_threshold.
+notify_when_no_hw_limit = true
+
+
 [brightness]
 # Master toggle for pure day/night circadian screen brightness (can also be
 # toggled live via tray menu or `smart-powerctl brightness on|off|toggle`).

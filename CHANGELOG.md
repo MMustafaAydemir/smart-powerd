@@ -5,6 +5,25 @@ All notable changes to `smart-powerd` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-11-26
+
+### Added
+- **Live Battery Percentage Tray Badge (Linux + Windows)**:
+  - Both `smart-power-tray` (Linux) and `smart-powerd.exe` / `windows/smart_power_win.py` (Windows) now render the live battery percentage number (e.g. `80`, `74`, `100`) directly on a crisp mode-colored taskbar tray badge, with a subtle charging accent when plugged in.
+- **Portable 80% Hardware Battery Charge Limit (`[battery_charge]`)**:
+  - Added `[battery_charge]` configuration (`limit_enabled = true`, `stop_threshold = 80`, `start_threshold = 75`, `notify_when_no_hw_limit = true`) and persistent `state.json` `charge_limit_enabled` override.
+  - Operates independently of Smart Optimize `ON`/`OFF` so pausing performance/power tuning never disables battery health protection; toggleable anytime via tray menu (`80% Charge Limit: ON / OFF`) or `smart-powerctl charge-limit on|off|toggle`.
+  - Auto-discovers and enforces Linux kernel hardware charge limits in priority order:
+    1. `BAT*/charge_control_end_threshold` (+ optional `charge_control_start_threshold`)
+    2. `BAT*/charge_stop_threshold` (+ optional `charge_start_threshold`)
+    3. `BAT*/charge_types` (`Long_Life` vs `Standard` — Uniwill / TongFang / Tuxedo mainline `uniwill_laptop`)
+    4. `ideapad_acpi` `conservation_mode` (Lenovo IdeaPad / Legion)
+    5. `lg-laptop/battery_care_limit` and `samsung/battery_life_extender`
+    6. `alert-only` fallback (Linux laptops without EC cutoff & Windows 10/11): sends a single tray notification per charge cycle when charging reaches `stop_threshold` (80%).
+  - Periodically re-verifies EC state after suspend/resume and captures/restores `charge_limit_baseline` cleanly in `baseline.json` on uninstall.
+- **10-Command Allowlisted Controls**:
+  - Extended `VALID_CONTROL_COMMANDS`, `smart-powerd-helper`, `smart-powerctl`, `smart-powerd.sudoers`, and `install.sh` with `charge-limit-on`, `charge-limit-off`, and `charge-limit-toggle`.
+
 ## [2.2.0] - 2026-11-26
 
 ### Added

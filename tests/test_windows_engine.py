@@ -370,13 +370,84 @@ class TestWindowsUtilities(unittest.TestCase):
             )
 
     def test_version_flag_and_bundled_config_lookup(self) -> None:
-        self.assertEqual(spw.VERSION, "2.2.0")
+        self.assertEqual(spw.VERSION, "2.3.0")
         self.assertEqual(spw.main(["--version"]), 0)
         bundled = spw.find_bundled_config_example()
         self.assertIsNotNone(bundled)
         assert bundled is not None
         self.assertTrue(bundled.is_file())
         self.assertEqual(bundled.name, "config.example.toml")
+
+    def test_charge_limit_alert_once_per_charge_cycle(self) -> None:
+        # Below 80% while charging -> do not notify
+        fire, flag = spw.evaluate_charge_limit_alert(
+            charge_limit_enabled=True,
+            charge_limit_hw_supported=False,
+            charge_limit_notify_fallback=True,
+            charge_limit_pct=80,
+            ac_online=True,
+            battery_present=True,
+            battery_status="Charging",
+            battery_pct=79,
+            already_notified=False,
+        )
+        self.assertEqual((fire, flag), (False, False))
+
+        # Reaches 80% while charging -> fires once and latches flag
+        fire, flag = spw.evaluate_charge_limit_alert(
+            charge_limit_enabled=True,
+            charge_limit_hw_supported=False,
+            charge_limit_notify_fallback=True,
+            charge_limit_pct=80,
+            ac_online=True,
+            battery_present=True,
+            battery_status="Charging",
+            battery_pct=80,
+            already_notified=False,
+        )
+        self.assertEqual((fire, flag), (True, True))
+
+        # Subsequent tick at 81% does not spam notification
+        fire, flag = spw.evaluate_charge_limit_alert(
+            charge_limit_enabled=True,
+            charge_limit_hw_supported=False,
+            charge_limit_notify_fallback=True,
+            charge_limit_pct=80,
+            ac_online=True,
+            battery_present=True,
+            battery_status="Charging",
+            battery_pct=81,
+            already_notified=True,
+        )
+        self.assertEqual((fire, flag), (False, True))
+
+        # Unplugging resets flag for the next charge cycle
+        fire, flag = spw.evaluate_charge_limit_alert(
+            charge_limit_enabled=True,
+            charge_limit_hw_supported=False,
+            charge_limit_notify_fallback=True,
+            charge_limit_pct=80,
+            ac_online=False,
+            battery_present=True,
+            battery_status="Discharging",
+            battery_pct=81,
+            already_notified=True,
+        )
+        self.assertEqual((fire, flag), (False, False))
+
+        # Hardware-enforced backend suppresses alert-only notification
+        fire, flag = spw.evaluate_charge_limit_alert(
+            charge_limit_enabled=True,
+            charge_limit_hw_supported=True,
+            charge_limit_notify_fallback=True,
+            charge_limit_pct=80,
+            ac_online=True,
+            battery_present=True,
+            battery_status="Charging",
+            battery_pct=85,
+            already_notified=False,
+        )
+        self.assertEqual((fire, flag), (False, False))
 
 
 if __name__ == "__main__":

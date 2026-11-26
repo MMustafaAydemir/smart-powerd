@@ -22,7 +22,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 _LIB_DIR = "/usr/local/lib/smart-power"
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -34,6 +34,7 @@ if _LIB_DIR not in sys.path:
 from smart_power_config import (  # noqa: E402
     DEFAULT_CONFIG_PATH,
     effective_brightness_config,
+    effective_charge_limit_config,
     load_config,
 )
 
@@ -66,6 +67,11 @@ NMI_WATCHDOG_PATH = Path("/proc/sys/kernel/nmi_watchdog")
 INTEL_NO_TURBO_PATH = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
 INTEL_MAX_PERF_PATH = Path("/sys/devices/system/cpu/intel_pstate/max_perf_pct")
 GLOBAL_CPUFREQ_BOOST_PATH = Path("/sys/devices/system/cpu/cpufreq/boost")
+IDEAPAD_CONSERVATION_GLOB = "/sys/bus/platform/drivers/ideapad_acpi/*/conservation_mode"
+LG_BATTERY_CARE_PATH = Path("/sys/devices/platform/lg-laptop/battery_care_limit")
+SAMSUNG_BATTERY_EXTENDER_PATH = Path(
+    "/sys/devices/platform/samsung/battery_life_extender"
+)
 
 MODE_RANK = {
     "off": 0,
@@ -506,6 +512,205 @@ def discover_pci_by_class(
     return matches
 
 
+class ChargeLimitBackend(NamedTuple):
+    """Detected Linux kernel/EC battery charge-limit control backend."""
+
+    backend: str
+    path: Path | None = None
+    start_path: Path | None = None
+    hw_supported: bool = False
+
+
+def _is_sysfs_writable(path: Path) -> bool:
+    try:
+        return path.is_file() and bool(path.stat().st_mode & 0o222)
+    except OSError:
+        return False
+
+
+def discover_charge_limit_backend(
+    bat_path: Path | None,
+    *,
+    ideapad_paths: list[Path] | None = None,
+    lg_path: Path | None = LG_BATTERY_CARE_PATH,
+    samsung_path: Path | None = SAMSUNG_BATTERY_EXTENDER_PATH,
+) -> ChargeLimitBackend:
+    """
+    Auto-detect the best writable hardware battery charge-limit sysfs backend
+    in priority order, falling back cleanly to 'alert-only'.
+    """
+    if bat_path is not None and bat_path.is_dir():
+        end_ctrl = bat_path / "charge_control_end_threshold"
+        if _is_sysfs_writable(end_ctrl):
+            start_ctrl = bat_path / "charge_control_start_threshold"
+            return ChargeLimitBackend(
+                backend="charge_control_end_threshold",
+                path=end_ctrl,
+                start_path=start_ctrl if _is_sysfs_writable(start_ctrl) else None,
+                hw_supported=True,
+            )
+
+        stop_ctrl = bat_path / "charge_stop_threshold"
+        if _is_sysfs_writable(stop_ctrl):
+            start_ctrl = bat_path / "charge_start_threshold"
+            return ChargeLimitBackend(
+                backend="charge_stop_threshold",
+                path=stop_ctrl,
+                start_path=start_ctrl if _is_sysfs_writable(start_ctrl) else None,
+                hw_supported=True,
+            )
+
+        charge_types = bat_path / "charge_types"
+        if _is_sysfs_writable(charge_types):
+            raw_types = read_text(charge_types, "") or ""
+            tokens = {tok.strip("[]") for tok in raw_types.split() if tok.strip("[]")}
+            if "Long_Life" in tokens and "Standard" in tokens:
+                return ChargeLimitBackend(
+                    backend="charge_types",
+                    path=charge_types,
+                    start_path=None,
+                    hw_supported=True,
+                )
+
+    ideapad_candidates = (
+        ideapad_paths
+        if ideapad_paths is not None
+        else sorted(Path(p) for p in glob.glob(IDEAPAD_CONSERVATION_GLOB))
+    )
+    for cm_path in ideapad_candidates:
+        if _is_sysfs_writable(cm_path):
+            return ChargeLimitBackend(
+                backend="conservation_mode",
+                path=cm_path,
+                start_path=None,
+                hw_supported=True,
+            )
+
+    if lg_path is not None and _is_sysfs_writable(lg_path):
+        return ChargeLimitBackend(
+            backend="battery_care_limit",
+            path=lg_path,
+            start_path=None,
+            hw_supported=True,
+        )
+
+    if samsung_path is not None and _is_sysfs_writable(samsung_path):
+        return ChargeLimitBackend(
+            backend="battery_life_extender",
+            path=samsung_path,
+            start_path=None,
+            hw_supported=True,
+        )
+
+    return ChargeLimitBackend(backend="alert-only", path=None, start_path=None, hw_supported=False)
+
+
+def read_charge_limit_active_value(backend: ChargeLimitBackend) -> str | None:
+    """Read current live value from a hardware charge-limit backend."""
+    if not backend.hw_supported or backend.path is None:
+        return None
+    if backend.backend == "charge_types":
+        return read_active_token(backend.path)
+    val = read_text(backend.path)
+    if val is None or val == "":
+        return None
+    if backend.backend in {
+        "charge_control_end_threshold",
+        "charge_stop_threshold",
+        "battery_care_limit",
+    }:
+        return f"{val}%" if val.isdigit() else val
+    return val
+
+
+def capture_charge_limit_baseline(backend: ChargeLimitBackend) -> dict[str, Any] | None:
+    """Capture original hardware charge-limit state for clean uninstall restoration."""
+    if not backend.hw_supported or backend.path is None:
+        return None
+    val = (
+        read_active_token(backend.path)
+        if backend.backend == "charge_types"
+        else read_text(backend.path)
+    )
+    return {
+        "backend": backend.backend,
+        "path": str(backend.path),
+        "value": val,
+        "start_path": str(backend.start_path) if backend.start_path is not None else None,
+        "start_value": read_text(backend.start_path) if backend.start_path is not None else None,
+    }
+
+
+def apply_charge_limit(
+    backend: ChargeLimitBackend,
+    enabled: bool,
+    stop_threshold: int = 80,
+    start_threshold: int = 75,
+    baseline: dict[str, Any] | None = None,
+) -> bool:
+    """
+    Apply or disable the hardware battery charge limit on the detected backend.
+    Returns True if a hardware backend was applied/verified, False for alert-only
+    or if the sysfs write failed.
+    """
+    if not backend.hw_supported or backend.path is None:
+        return False
+
+    try:
+        stop_val = max(50, min(100, int(stop_threshold)))
+    except (TypeError, ValueError):
+        stop_val = 80
+    try:
+        start_val = max(40, min(95, int(start_threshold)))
+    except (TypeError, ValueError):
+        start_val = 75
+    start_val = min(start_val, max(40, stop_val - 5))
+
+    if backend.backend in {"charge_control_end_threshold", "charge_stop_threshold"}:
+        if enabled:
+            cur_end_raw = read_text(backend.path)
+            cur_end = int(cur_end_raw) if (cur_end_raw and cur_end_raw.isdigit()) else None
+            if backend.start_path is not None:
+                if cur_end is not None and cur_end < stop_val:
+                    ok_end = write_text(backend.path, str(stop_val))
+                    write_text(backend.start_path, str(start_val))
+                    return ok_end
+                write_text(backend.start_path, str(start_val))
+                return write_text(backend.path, str(stop_val))
+            return write_text(backend.path, str(stop_val))
+
+        # Disabled -> restore full 100% charging (write end before start!)
+        ok_end = write_text(backend.path, "100")
+        if backend.start_path is not None:
+            restore_start = "0"
+            if isinstance(baseline, dict):
+                b_start = baseline.get("start_value")
+                if isinstance(b_start, str) and b_start.isdigit() and int(b_start) < 100:
+                    restore_start = b_start
+            write_text(backend.start_path, restore_start)
+        return ok_end
+
+    if backend.backend == "charge_types":
+        target = "Long_Life" if (enabled and stop_val <= 85) else "Standard"
+        if read_active_token(backend.path) == target:
+            return True
+        return write_text(backend.path, target)
+
+    if backend.backend == "conservation_mode":
+        target = "1" if (enabled and stop_val < 100) else "0"
+        return write_text(backend.path, target)
+
+    if backend.backend == "battery_care_limit":
+        target = "80" if (enabled and stop_val <= 85) else "100"
+        return write_text(backend.path, target)
+
+    if backend.backend == "battery_life_extender":
+        target = "1" if (enabled and stop_val < 100) else "0"
+        return write_text(backend.path, target)
+
+    return False
+
+
 class SmartPowerDaemon:
     """Portable adaptive power daemon polling /proc and /sys with minimal wakeups."""
 
@@ -581,6 +786,7 @@ class SmartPowerDaemon:
             for p in glob.glob("/sys/class/leds/*kbd_backlight*")
             if (Path(p) / "brightness").is_file()
         )
+        self.charge_limit_backend = discover_charge_limit_backend(self.bat_path)
 
         # Persistent toggle state & hardware baseline
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -598,6 +804,8 @@ class SmartPowerDaemon:
         self.inhibit_fd: int | None = None
         self.last_wifi_ps: str | None = None
         self.wifi_tick_counter = 0
+        self.charge_recheck_counter = 0
+        self._charge_limit_applied_once = False
         self.kbd_dimmed = False
         self.saved_kbd_brightness: dict[str, str] = {}
 
@@ -736,6 +944,7 @@ class SmartPowerDaemon:
         default_state: dict[str, Any] = {
             "enabled": True,
             "brightness_enabled": None,
+            "charge_limit_enabled": None,
         }
         raw = read_text(STATE_FILE)
         if raw:
@@ -747,6 +956,11 @@ class SmartPowerDaemon:
                         "brightness_enabled": (
                             data["brightness_enabled"]
                             if isinstance(data.get("brightness_enabled"), bool)
+                            else None
+                        ),
+                        "charge_limit_enabled": (
+                            data["charge_limit_enabled"]
+                            if isinstance(data.get("charge_limit_enabled"), bool)
                             else None
                         ),
                     }
@@ -858,6 +1072,11 @@ class SmartPowerDaemon:
             dirty = True
         if "platform_profile" not in baseline:
             baseline["platform_profile"] = read_text(PLATFORM_PROFILE_PATH)
+            dirty = True
+        if "charge_limit_baseline" not in baseline:
+            baseline["charge_limit_baseline"] = capture_charge_limit_baseline(
+                self.charge_limit_backend
+            )
             dirty = True
 
         sata_base = baseline.get("sata_alpm")
@@ -1757,6 +1976,17 @@ class SmartPowerDaemon:
             return "none"
         return read_text(self.sata_alpm_paths[0], "unknown") or "unknown"
 
+    def _apply_charge_limit_policy(self) -> bool:
+        """Enforce configured battery charge limit independently of Smart Optimize ON/OFF."""
+        ccfg = effective_charge_limit_config(self.config, self.state)
+        return apply_charge_limit(
+            self.charge_limit_backend,
+            enabled=bool(ccfg["limit_enabled"]),
+            stop_threshold=int(ccfg["stop_threshold"]),
+            start_threshold=int(ccfg["start_threshold"]),
+            baseline=self.baseline.get("charge_limit_baseline"),
+        )
+
     def _publish_status(self, bat_info: dict[str, Any] | None = None) -> None:
         epp = self._read_current_epp_or_gov()
         aspm = read_active_token(self.aspm_path) or "unknown"
@@ -1819,6 +2049,7 @@ class SmartPowerDaemon:
         self.last_refresh_profile = desired_refresh
 
         platform_profile = read_text(PLATFORM_PROFILE_PATH) or "none"
+        ccfg = effective_charge_limit_config(self.config, self.state)
 
         payload = {
             "timestamp": time.time(),
@@ -1835,6 +2066,14 @@ class SmartPowerDaemon:
             "dirty_writeback_cs": self._read_dirty_writeback_cs(),
             "sata_alpm": self._read_sata_alpm(),
             "charge_thresholds": self._read_charge_thresholds(),
+            "charge_limit_enabled": bool(ccfg["limit_enabled"]),
+            "charge_limit_pct": int(ccfg["stop_threshold"]),
+            "charge_limit_hw_supported": bool(self.charge_limit_backend.hw_supported),
+            "charge_limit_backend": self.charge_limit_backend.backend,
+            "charge_limit_active_value": read_charge_limit_active_value(
+                self.charge_limit_backend
+            ),
+            "charge_limit_notify_fallback": bool(ccfg["notify_when_no_hw_limit"]),
             "desired_refresh_profile": desired_refresh,
             "ac_refresh_hz": ac_refresh_hz,
             "battery_refresh_hz": battery_refresh_hz,
@@ -1891,10 +2130,24 @@ class SmartPowerDaemon:
         return raw_mode, raw_reason
 
     def tick(self) -> None:
+        reloaded = False
         if self._reload_requested:
             self._reload_requested = False
             self._apply_config(load_config(self.config_path))
             self._force_reapply = True
+            reloaded = True
+
+        # Enforce hardware battery charge limit on startup, reload, and every
+        # wifi_recheck_ticks (~15s) in case suspend/resume resets EC state.
+        if not self._charge_limit_applied_once or reloaded:
+            self._apply_charge_limit_policy()
+            self._charge_limit_applied_once = True
+            self.charge_recheck_counter = 0
+        else:
+            self.charge_recheck_counter += 1
+            if self.charge_recheck_counter >= self.wifi_recheck_ticks:
+                self.charge_recheck_counter = 0
+                self._apply_charge_limit_policy()
 
         now = time.monotonic()
         (
@@ -1957,6 +2210,7 @@ class SmartPowerDaemon:
         if cmd == "reload":
             self._apply_config(load_config(self.config_path))
             self._force_reapply = True
+            self._apply_charge_limit_policy()
             bat_info = self._read_battery_telemetry()
             cur_mode = self.current_mode or ("light" if self.enabled else "off")
             self._apply_mode(
@@ -1985,6 +2239,29 @@ class SmartPowerDaemon:
             return {
                 "ok": True,
                 "brightness_enabled": new_val,
+                "enabled": self.enabled,
+                "mode": self.current_mode or ("light" if self.enabled else "off"),
+            }
+
+        if cmd in {"charge-limit-on", "charge-limit-off", "charge-limit-toggle"}:
+            ccfg = effective_charge_limit_config(self.config, self.state)
+            if cmd == "charge-limit-toggle":
+                new_val = not bool(ccfg["limit_enabled"])
+            else:
+                new_val = cmd == "charge-limit-on"
+            self.state["charge_limit_enabled"] = new_val
+            self._save_state()
+            self._apply_charge_limit_policy()
+            self._publish_status()
+            return {
+                "ok": True,
+                "charge_limit_enabled": new_val,
+                "charge_limit_pct": int(ccfg["stop_threshold"]),
+                "charge_limit_hw_supported": bool(self.charge_limit_backend.hw_supported),
+                "charge_limit_backend": self.charge_limit_backend.backend,
+                "charge_limit_active_value": read_charge_limit_active_value(
+                    self.charge_limit_backend
+                ),
                 "enabled": self.enabled,
                 "mode": self.current_mode or ("light" if self.enabled else "off"),
             }

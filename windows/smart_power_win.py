@@ -49,7 +49,7 @@ from typing import Any, Callable, Sequence
 IS_WINDOWS = sys.platform == "win32"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 CREATE_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # Ensure shared repository modules are importable and take precedence over any
 # system-installed copy whether launched from repo/windows/smart_power_win.py
@@ -69,6 +69,7 @@ def _prioritize_local_paths() -> None:
 
 _prioritize_local_paths()
 
+import smart_power_config  # noqa: E402
 from smart_power_config import (  # noqa: E402
     DEFAULT_CONFIG,
     effective_brightness_config,
@@ -573,8 +574,56 @@ def resolve_windows_config_path(explicit_path: str | Path | None = None) -> Path
     return user_cfg
 
 
+DEFAULT_BATTERY_CHARGE_CONFIG: dict[str, Any] = {
+    "limit_enabled": True,
+    "stop_threshold": 80,
+    "start_threshold": 75,
+    "notify_when_no_hw_limit": True,
+}
+
+
+def resolve_charge_limit_config(
+    config: dict[str, Any],
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Resolve effective ``[battery_charge]`` configuration with runtime
+    ``state.json`` ``charge_limit_enabled`` override and safe threshold clamps.
+    Delegates to ``smart_power_config.effective_charge_limit_config`` when present.
+    """
+    shared_fn = getattr(smart_power_config, "effective_charge_limit_config", None)
+    if callable(shared_fn):
+        raw = shared_fn(config, state)
+    else:
+        raw = copy.deepcopy(DEFAULT_BATTERY_CHARGE_CONFIG)
+        cfg_sec = config.get("battery_charge") if isinstance(config, dict) else None
+        if isinstance(cfg_sec, dict):
+            for k in raw:
+                if k in cfg_sec and cfg_sec[k] is not None:
+                    raw[k] = cfg_sec[k]
+        if isinstance(state, dict) and isinstance(state.get("charge_limit_enabled"), bool):
+            raw["limit_enabled"] = state["charge_limit_enabled"]
+
+    try:
+        stop_pct = max(50, min(100, int(round(float(raw.get("stop_threshold", 80))))))
+    except (TypeError, ValueError):
+        stop_pct = 80
+    try:
+        start_pct = max(40, min(95, int(round(float(raw.get("start_threshold", 75))))))
+    except (TypeError, ValueError):
+        start_pct = 75
+    start_pct = min(start_pct, max(40, stop_pct - 5))
+
+    return {
+        "limit_enabled": bool(raw.get("limit_enabled", True)),
+        "stop_threshold": stop_pct,
+        "start_threshold": start_pct,
+        "notify_when_no_hw_limit": bool(raw.get("notify_when_no_hw_limit", True)),
+    }
+
+
 def load_windows_config(path: str | Path | None = None) -> dict[str, Any]:
-    """Load TOML config via smart_power_config and ensure 3-tier refresh defaults."""
+    """Load TOML config via smart_power_config and ensure 3-tier refresh & charge defaults."""
     resolved = resolve_windows_config_path(path)
     cfg = load_config(resolved)
     bt = cfg.setdefault("battery_tricks", {})
@@ -584,6 +633,7 @@ def load_windows_config(path: str | Path | None = None) -> dict[str, Any]:
     bt.setdefault("battery_refresh_hz", 0)
     bt.setdefault("low_battery_refresh_pct", 20)
     bt.setdefault("low_refresh_hz", 60)
+    cfg["battery_charge"] = resolve_charge_limit_config(cfg, None)
     cfg["brightness"] = normalize_brightness_config(cfg.get("brightness"))
     return cfg
 
@@ -1170,6 +1220,60 @@ def apply_mode_cooldown(
 
     new_ts = now if des_rank > MODE_RANK["light"] else 0.0
     return des, new_ts
+
+
+def evaluate_charge_limit_alert(
+    *,
+    charge_limit_enabled: bool,
+    charge_limit_hw_supported: bool,
+    charge_limit_notify_fallback: bool,
+    charge_limit_pct: int,
+    ac_online: bool,
+    battery_present: bool,
+    battery_status: str,
+    battery_pct: int | float | None,
+    already_notified: bool,
+) -> tuple[bool, bool]:
+    """
+    Evaluate once-per-charge-cycle charging threshold notification state on
+    platforms without a hardware EC cutoff backend (alert-only fallback).
+
+    Returns ``(should_notify_now, next_notified_flag)``:
+      - Fires once when enabled, no HW limit, fallback notification is enabled,
+        ``battery_status`` is ``"charging"`` on AC, and ``battery_pct >= charge_limit_pct``.
+      - Resets ``already_notified`` once unplugged (``not ac_online``), disabled,
+        or ``battery_pct < charge_limit_pct - 2``.
+    """
+    if (
+        not charge_limit_enabled
+        or charge_limit_hw_supported
+        or not charge_limit_notify_fallback
+        or not battery_present
+    ):
+        return False, False
+
+    if not ac_online:
+        return False, False
+
+    if battery_pct is None:
+        return False, already_notified
+
+    try:
+        pct = float(battery_pct)
+    except (TypeError, ValueError):
+        return False, already_notified
+    if not math.isfinite(pct):
+        return False, already_notified
+
+    threshold = max(50.0, min(100.0, float(charge_limit_pct)))
+    if pct < (threshold - 2.0):
+        return False, False
+
+    is_charging = str(battery_status or "").strip().lower() == "charging"
+    if is_charging and pct >= threshold and not already_notified:
+        return True, True
+
+    return False, already_notified
 
 
 # ---------------------------------------------------------------------------
@@ -2016,6 +2120,7 @@ class WindowsPowerEngine:
         default_state: dict[str, Any] = {
             "enabled": True,
             "brightness_enabled": None,
+            "charge_limit_enabled": None,
         }
         raw = read_json_file(self.state_path)
         if raw is None:
@@ -2031,6 +2136,9 @@ class WindowsPowerEngine:
 
     def effective_brightness_cfg(self) -> dict[str, Any]:
         return normalize_brightness_config(effective_brightness_config(self.config, self.state))
+
+    def effective_charge_limit_cfg(self) -> dict[str, Any]:
+        return resolve_charge_limit_config(self.config, self.state)
 
     def reload_config(self) -> dict[str, Any]:
         self.config = load_windows_config(self.config_path)
@@ -2057,6 +2165,15 @@ class WindowsPowerEngine:
         if not cur:
             self.brightness_ctrl.clear_manual_override()
         return not cur
+
+    def set_charge_limit_enabled(self, enabled: bool) -> bool:
+        self.state["charge_limit_enabled"] = bool(enabled)
+        self._save_state()
+        return bool(enabled)
+
+    def toggle_charge_limit(self) -> bool:
+        cur = bool(self.effective_charge_limit_cfg().get("limit_enabled", True))
+        return self.set_charge_limit_enabled(not cur)
 
     def _sample_system_metrics(self, now: float) -> tuple[list[dict[str, Any]], float, float, float]:
         """Collect process list, total CPU %, max core CPU %, and network RX MiB/s via psutil."""
@@ -2250,6 +2367,9 @@ class WindowsPowerEngine:
         # Pure day/night circadian adaptive brightness
         bright_tel = self.brightness_ctrl.update(config=bcfg, ac_online=ac_online, now=ts)
 
+        # Battery charge limit telemetry (independent of Smart Optimize ON/OFF)
+        cl_cfg = self.effective_charge_limit_cfg()
+
         status: dict[str, Any] = {
             "platform": "windows",
             "version": VERSION,
@@ -2262,6 +2382,12 @@ class WindowsPowerEngine:
             "battery_pct": battery_pct,
             "battery_status": bat["battery_status"],
             "battery_watts": bat["battery_watts"],
+            "charge_limit_enabled": bool(cl_cfg["limit_enabled"]),
+            "charge_limit_pct": int(cl_cfg["stop_threshold"]),
+            "charge_limit_hw_supported": False,
+            "charge_limit_backend": "alert-only",
+            "charge_limit_active_value": None,
+            "charge_limit_notify_fallback": bool(cl_cfg["notify_when_no_hw_limit"]),
             "cpu_pct": round(total_cpu, 1),
             "max_core_cpu_pct": round(max_core, 1),
             "rx_mib_s": round(rx_mib_s, 2),
@@ -2340,12 +2466,25 @@ def format_battery_line(status: dict[str, Any]) -> str:
     if not status.get("battery_present", True):
         return "No battery (AC)"
     watts = float(status.get("battery_watts") or 0.0)
-    bstat = str(status.get("battery_status") or "Unknown").lower()
+    bstat = str(status.get("battery_status") or "Unknown").strip()
+    bstat_display = bstat.title() if bstat else "Unknown"
     bpct = status.get("battery_pct")
-    pct_str = f"{bpct}%" if bpct is not None else "?%"
+    pct_str = f"{int(round(float(bpct)))}%" if bpct is not None else "?%"
     if watts > 0.0:
-        return f"{watts:.2f} W {bstat} ({pct_str})"
-    return f"{bstat.title()} ({pct_str})"
+        return f"{pct_str} — {bstat_display} ({watts:.2f} W)"
+    return f"{pct_str} — {bstat_display}"
+
+
+def format_charge_limit_line(status: dict[str, Any]) -> str:
+    cl_enabled = bool(status.get("charge_limit_enabled", True))
+    limit_pct = int(status.get("charge_limit_pct", 80) or 80)
+    hw_sup = bool(status.get("charge_limit_hw_supported", False))
+    active_val = status.get("charge_limit_active_value")
+    if not cl_enabled:
+        return "OFF (100%)"
+    if hw_sup:
+        return f"{limit_pct}% (ON — {active_val})" if active_val else f"{limit_pct}% (ON)"
+    return f"{limit_pct}% (Alert Only)"
 
 
 def format_status_report(status: dict[str, Any]) -> str:
@@ -2357,6 +2496,7 @@ def format_status_report(status: dict[str, Any]) -> str:
         f"Smart Optimize : {state_str}",
         f"Trigger        : {status.get('reason', '--')}",
         f"Battery        : {format_battery_line(status)}",
+        f"Charge Limit   : {format_charge_limit_line(status)}",
         f"Power Overlay  : {status.get('power_overlay', 'Unknown')}",
         f"Wi-Fi PS       : {status.get('wifi_power_save', 'Unknown')}",
         f"PCIe ASPM      : {status.get('pcie_aspm', 'Unknown')}",
@@ -2375,8 +2515,8 @@ def format_status_report(status: dict[str, Any]) -> str:
 
 def _run_tray_app(engine: WindowsPowerEngine) -> int:
     try:
-        from PyQt6.QtCore import QPointF, Qt, QTimer
-        from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
+        from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer
+        from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF
         from PyQt6.QtNetwork import QLocalServer, QLocalSocket
         from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
     except ImportError as exc:
@@ -2387,7 +2527,12 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
         )
         return 1
 
-    def render_tray_icon(mode: str, enabled: bool) -> QIcon:
+    def render_tray_icon(
+        mode: str,
+        enabled: bool,
+        battery_pct: int | None = None,
+        charging: bool = False,
+    ) -> QIcon:
         key = mode if enabled else "off"
         bg_hex = MODE_COLORS.get(key, MODE_COLORS["off"])
 
@@ -2396,7 +2541,47 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
 
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
+        if battery_pct is not None:
+            pct_val = max(0, min(100, int(round(battery_pct))))
+            text = str(pct_val)
+
+            # High-contrast rounded badge so percentage digits remain crisp at 16-24px tray scale
+            painter.setPen(QPen(QColor("#1c242b"), 3.0))
+            painter.setBrush(QColor(bg_hex))
+            painter.drawRoundedRect(QRectF(3.0, 3.0, 58.0, 58.0), 12.0, 12.0)
+
+            font = QFont()
+            font.setStyleHint(QFont.StyleHint.SansSerif)
+            font.setBold(True)
+            if len(text) >= 3:
+                font.setPixelSize(26)
+            elif len(text) == 2:
+                font.setPixelSize(34)
+            else:
+                font.setPixelSize(38)
+            painter.setFont(font)
+
+            text_rect = QRectF(2.0, 1.0 if charging else 2.0, 60.0, 56.0 if charging else 60.0)
+            # Subtle dark shadow for crisp contrast on all mode colors
+            painter.setPen(QColor("#1c242b"))
+            painter.drawText(text_rect.translated(1.5, 1.5), Qt.AlignmentFlag.AlignCenter, text)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+            if charging:
+                # Subtle bright yellow/gold charging accent bar + top-right dot
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor("#fff176"))
+                painter.drawRoundedRect(QRectF(14.0, 52.0, 36.0, 5.0), 2.5, 2.5)
+                painter.setPen(QPen(QColor("#1c242b"), 1.5))
+                painter.drawEllipse(QRectF(47.0, 7.0, 10.0, 10.0))
+
+            painter.end()
+            return QIcon(pixmap)
+
+        # Desktop / no-battery fallback: classic circular mode badge
         painter.setPen(QPen(QColor("#1c242b"), 3.0))
         painter.setBrush(QColor(bg_hex))
         painter.drawEllipse(4, 4, 56, 56)
@@ -2478,8 +2663,9 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
 
     class SmartPowerWinTray:
         def __init__(self) -> None:
-            self._icon_cache: dict[str, QIcon] = {}
-            self._last_icon_key: str | None = None
+            self._icon_cache: dict[tuple[str, int | None, bool], QIcon] = {}
+            self._last_icon_key: tuple[str, int | None, bool] | None = None
+            self._charge_limit_notified: bool = False
             self._cleaned_up = False
 
             self.tray = QSystemTrayIcon()
@@ -2489,6 +2675,7 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             self.act_state = self._make_info("Smart Optimize: Starting...")
             self.act_reason = self._make_info("Trigger: --")
             self.act_battery = self._make_info("Battery: --")
+            self.act_charge_limit = self._make_info("Charge Limit: --")
             self.act_overlay = self._make_info("Overlay: -- | Wi-Fi PS: --")
             self.act_refresh = self._make_info("Refresh: --")
             self.act_brightness = self._make_info("Brightness: --")
@@ -2497,6 +2684,7 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
                 self.act_state,
                 self.act_reason,
                 self.act_battery,
+                self.act_charge_limit,
                 self.act_overlay,
                 self.act_refresh,
                 self.act_brightness,
@@ -2508,6 +2696,10 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             self.act_toggle = QAction("Turn Smart Optimize OFF", self.menu)
             self.act_toggle.triggered.connect(self._on_toggle)
             self.menu.addAction(self.act_toggle)
+
+            self.act_charge_limit_toggle = QAction("80% Charge Limit: ON", self.menu)
+            self.act_charge_limit_toggle.triggered.connect(self._on_charge_limit_toggle)
+            self.menu.addAction(self.act_charge_limit_toggle)
 
             self.act_brightness_toggle = QAction("Auto Brightness: ON", self.menu)
             self.act_brightness_toggle.triggered.connect(self._on_brightness_toggle)
@@ -2551,11 +2743,28 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             act.setEnabled(False)
             return act
 
-        def _get_icon(self, mode: str, enabled: bool) -> QIcon:
-            key = mode if enabled else "off"
-            if key not in self._icon_cache:
-                self._icon_cache[key] = render_tray_icon(mode, enabled)
-            return self._icon_cache[key]
+        def _get_icon(
+            self,
+            mode: str,
+            enabled: bool,
+            battery_pct: int | None,
+            charging: bool,
+        ) -> QIcon:
+            mode_key = mode if enabled else "off"
+            pct_key = (
+                max(0, min(100, int(round(battery_pct))))
+                if battery_pct is not None
+                else None
+            )
+            cache_key = (mode_key, pct_key, bool(charging))
+            if cache_key not in self._icon_cache:
+                if len(self._icon_cache) >= 64:
+                    oldest = next(iter(self._icon_cache))
+                    self._icon_cache.pop(oldest, None)
+                self._icon_cache[cache_key] = render_tray_icon(
+                    mode, enabled, battery_pct=pct_key, charging=bool(charging)
+                )
+            return self._icon_cache[cache_key]
 
         def _on_poll(self) -> None:
             st = engine.tick(now=time.time())
@@ -2564,25 +2773,39 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
         def _refresh_ui(self, st: dict[str, Any]) -> None:
             enabled = bool(st.get("enabled", True))
             mode = str(st.get("mode", "light" if enabled else "off"))
-            icon_key = mode if enabled else "off"
+            bat_present = bool(st.get("battery_present", False))
+            raw_pct = st.get("battery_pct") if bat_present else None
+            pct_int = (
+                max(0, min(100, int(round(float(raw_pct)))))
+                if isinstance(raw_pct, (int, float))
+                else None
+            )
+            bat_status = str(st.get("battery_status") or "")
+            is_charging = bat_present and bat_status.strip().lower() == "charging"
+
+            icon_key = (mode if enabled else "off", pct_int, is_charging)
             if icon_key != self._last_icon_key:
-                self.tray.setIcon(self._get_icon(mode, enabled))
+                self.tray.setIcon(self._get_icon(mode, enabled, pct_int, is_charging))
                 self._last_icon_key = icon_key
 
             toggle_label = "ON" if enabled else "OFF"
             mode_label = MODE_LABELS.get(mode, mode.title())
             reason = str(st.get("reason") or "--")
             bat_line = format_battery_line(st)
+            charge_limit_line = format_charge_limit_line(st)
             overlay = str(st.get("power_overlay") or "Unknown")
             wifi_ps = str(st.get("wifi_power_save") or "Unknown")
             refresh_line = format_refresh_line(st)
             bright_line = format_brightness_line(st)
             bcfg = engine.effective_brightness_cfg()
+            cl_enabled = bool(st.get("charge_limit_enabled", True))
+            cl_pct = int(st.get("charge_limit_pct", 80) or 80)
 
             tooltip = (
                 f"Smart Optimize: {toggle_label} | Mode: {mode_label}\n"
                 f"Trigger: {reason}\n"
                 f"Battery: {bat_line}\n"
+                f"Charge Limit: {charge_limit_line}\n"
                 f"Overlay: {overlay} | Wi-Fi PS: {wifi_ps}\n"
                 f"Refresh: {refresh_line}\n"
                 f"Brightness: {bright_line}"
@@ -2592,6 +2815,7 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             self.act_state.setText(f"Smart Optimize: {toggle_label} ({mode_label})")
             self.act_reason.setText(f"Trigger: {reason[:52]}")
             self.act_battery.setText(f"Battery: {bat_line}")
+            self.act_charge_limit.setText(f"Charge Limit: {charge_limit_line}")
             self.act_overlay.setText(f"Overlay: {overlay} | Wi-Fi PS: {wifi_ps}")
             self.act_refresh.setText(f"Refresh: {refresh_line}")
             self.act_brightness.setText(f"Brightness: {bright_line}")
@@ -2599,9 +2823,37 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
             self.act_toggle.setText(
                 "Turn Smart Optimize OFF" if enabled else "Turn Smart Optimize ON"
             )
+            self.act_charge_limit_toggle.setText(
+                f"{cl_pct}% Charge Limit: {'ON' if cl_enabled else 'OFF'}"
+            )
             self.act_brightness_toggle.setText(
                 f"Auto Brightness: {'ON' if bcfg.get('enabled', True) else 'OFF'}"
             )
+
+            # Once-per-charge-cycle Windows notification when charging reaches stop_threshold
+            should_notify, next_notified = evaluate_charge_limit_alert(
+                charge_limit_enabled=cl_enabled,
+                charge_limit_hw_supported=bool(st.get("charge_limit_hw_supported", False)),
+                charge_limit_notify_fallback=bool(st.get("charge_limit_notify_fallback", True)),
+                charge_limit_pct=cl_pct,
+                ac_online=bool(st.get("ac_online", True)),
+                battery_present=bat_present,
+                battery_status=bat_status,
+                battery_pct=pct_int,
+                already_notified=self._charge_limit_notified,
+            )
+            self._charge_limit_notified = next_notified
+            if should_notify and pct_int is not None:
+                self.tray.showMessage(
+                    f"Battery reached {cl_pct}%",
+                    (
+                        f"Battery is at {pct_int}% while charging. "
+                        "Unplug AC (or enable your OEM battery conservation limit) "
+                        "to preserve long-term battery health."
+                    ),
+                    QSystemTrayIcon.MessageIcon.Information,
+                    8000,
+                )
 
         def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
             if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -2609,6 +2861,11 @@ def _run_tray_app(engine: WindowsPowerEngine) -> int:
 
         def _on_toggle(self) -> None:
             engine.toggle_enabled()
+            self._on_poll()
+
+        def _on_charge_limit_toggle(self) -> None:
+            engine.toggle_charge_limit()
+            self._charge_limit_notified = False
             self._on_poll()
 
         def _on_brightness_toggle(self) -> None:

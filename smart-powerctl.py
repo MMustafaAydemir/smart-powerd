@@ -6,6 +6,7 @@ Supports:
   smart-powerctl status [--json]
   smart-powerctl on|off|toggle|reload
   smart-powerctl brightness on|off|toggle
+  smart-powerctl charge-limit on|off|toggle
 """
 
 from __future__ import annotations
@@ -36,6 +37,9 @@ except ImportError:
         "brightness-on",
         "brightness-off",
         "brightness-toggle",
+        "charge-limit-on",
+        "charge-limit-off",
+        "charge-limit-toggle",
     )
 
 STATUS_FILE = Path("/run/smart-powerd/status.json")
@@ -112,6 +116,25 @@ def _format_refresh_line(st: dict[str, Any], disp: dict[str, Any] | None) -> str
     return f"profile={desired} ({tier_label}) | low<{low_pct}% -> {low_hz} Hz | tray inactive"
 
 
+def _format_charge_limit_line(st: dict[str, Any]) -> str:
+    limit_on = bool(st.get("charge_limit_enabled", True))
+    limit_pct = st.get("charge_limit_pct", 80)
+    hw_supported = bool(st.get("charge_limit_hw_supported", False))
+    backend = str(st.get("charge_limit_backend", "alert-only"))
+    active_val = st.get("charge_limit_active_value")
+
+    if limit_on:
+        if hw_supported:
+            detail = f"{backend}: {active_val}" if active_val is not None else backend
+            return f"ON ({limit_pct}% via {detail})"
+        return f"ON ({limit_pct}% — Alert Only)"
+
+    if hw_supported:
+        detail = f"{backend}: {active_val}" if active_val is not None else backend
+        return f"OFF (100% via {detail})"
+    return "OFF (100% — Alert Only)"
+
+
 def print_status(as_json: bool) -> int:
     if not STATUS_FILE.is_file():
         if as_json:
@@ -183,6 +206,7 @@ def print_status(as_json: bool) -> int:
         th_str = ", ".join(f"{k}={v}" for k, v in sorted(thresholds.items()))
         bat_line += f" | thresholds: {th_str}"
     print(f"Battery        : {bat_line}")
+    print(f"Charge Limit   : {_format_charge_limit_line(st)}")
     print(f"Sleep Inhibit  : {st.get('inhibit_active')}")
     return 0
 
@@ -202,6 +226,8 @@ def resolve_control_command(args: list[str]) -> str | None:
         return args[0]
     if len(args) == 2 and args[0] == "brightness" and args[1] in {"on", "off", "toggle"}:
         return f"brightness-{args[1]}"
+    if len(args) == 2 and args[0] == "charge-limit" and args[1] in {"on", "off", "toggle"}:
+        return f"charge-limit-{args[1]}"
     return None
 
 
@@ -210,7 +236,8 @@ def print_usage() -> None:
         "Usage:\n"
         "  smart-powerctl status [--json]\n"
         "  smart-powerctl {on|off|toggle|reload}\n"
-        "  smart-powerctl brightness {on|off|toggle}",
+        "  smart-powerctl brightness {on|off|toggle}\n"
+        "  smart-powerctl charge-limit {on|off|toggle}",
         file=sys.stderr,
     )
 

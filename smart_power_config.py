@@ -25,6 +25,9 @@ VALID_CONTROL_COMMANDS: tuple[str, ...] = (
     "brightness-on",
     "brightness-off",
     "brightness-toggle",
+    "charge-limit-on",
+    "charge-limit-off",
+    "charge-limit-toggle",
 )
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -55,6 +58,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "battery_refresh_hz": 0,
         "low_battery_refresh_pct": 20,
         "low_refresh_hz": 60,
+    },
+    "battery_charge": {
+        "limit_enabled": True,
+        "stop_threshold": 80,
+        "start_threshold": 75,
+        "notify_when_no_hw_limit": True,
     },
     "brightness": {
         "enabled": True,
@@ -152,6 +161,13 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         if k in allowed_brightness_keys
     }
 
+    allowed_charge_keys = set(DEFAULT_CONFIG["battery_charge"].keys())
+    merged["battery_charge"] = {
+        k: v
+        for k, v in merged["battery_charge"].items()
+        if k in allowed_charge_keys
+    }
+
     return merged
 
 
@@ -174,3 +190,41 @@ def effective_brightness_config(
             base["enabled"] = state["brightness_enabled"]
 
     return base
+
+
+def effective_charge_limit_config(
+    config: dict[str, Any], state: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """
+    Return the effective battery charge-limit configuration with clamped
+    thresholds and runtime state.json boolean override (`charge_limit_enabled`).
+    """
+    base = copy.deepcopy(DEFAULT_CONFIG["battery_charge"])
+    allowed_keys = set(base.keys())
+    cfg_section = config.get("battery_charge") if isinstance(config, dict) else None
+    if isinstance(cfg_section, dict):
+        filtered = {k: v for k, v in cfg_section.items() if k in allowed_keys}
+        base = deep_merge(base, filtered)
+
+    try:
+        stop_threshold = max(50, min(100, int(base.get("stop_threshold", 80))))
+    except (TypeError, ValueError):
+        stop_threshold = 80
+    try:
+        start_threshold = max(40, min(95, int(base.get("start_threshold", 75))))
+    except (TypeError, ValueError):
+        start_threshold = 75
+    start_threshold = min(start_threshold, max(40, stop_threshold - 5))
+
+    result: dict[str, Any] = {
+        "limit_enabled": bool(base.get("limit_enabled", True)),
+        "stop_threshold": stop_threshold,
+        "start_threshold": start_threshold,
+        "notify_when_no_hw_limit": bool(base.get("notify_when_no_hw_limit", True)),
+    }
+
+    if isinstance(state, dict):
+        if isinstance(state.get("charge_limit_enabled"), bool):
+            result["limit_enabled"] = state["charge_limit_enabled"]
+
+    return result

@@ -1,8 +1,8 @@
 # smart-powerd
 
-**Cross-platform (Linux + Windows 10/11) adaptive, workload-aware laptop power, day/night circadian brightness, and 3-tier refresh-rate optimizer.**
+**Cross-platform (Linux + Windows 10/11) adaptive, workload-aware laptop power, 80% hardware battery charge limit, day/night circadian brightness, and 3-tier refresh-rate optimizer.**
 
-`smart-powerd` extends battery life and keeps laptops cool and quiet during everyday browsing, coding, and reading—without sacrificing burst responsiveness or full performance during builds, video calls, downloads, or gaming. It is hardware-agnostic, distro-agnostic, reversible, zero-camera, and designed from the ground up to never wake a suspended discrete GPU or interfere with battery charge limits.
+`smart-powerd` extends both daily runtime and long-term battery health—keeping laptops cool and quiet during everyday browsing, coding, and reading, capping charging at 80% in hardware, and displaying live battery percentage directly on your tray icon—without sacrificing burst responsiveness or full performance during builds, video calls, downloads, or gaming. It is hardware-agnostic, distro-agnostic, reversible, zero-camera, and designed from the ground up to never wake a suspended discrete GPU.
 
 ---
 
@@ -11,14 +11,32 @@
 - **Cross-Platform (Linux + Standalone Windows `.exe`)**:
   - **Linux**: Root systemd daemon (`smart-powerd`) + allowlisted `sudoers` helper + PyQt6 tray (`smart-power-tray`) + CLI (`smart-powerctl`).
   - **Windows 10/11**: Downloadable standalone **`smart-powerd.exe`** (zero Python required) or Python source (`windows/smart_power_win.py`) using native Win32 `powrprof.dll`, `powercfg`, `ChangeDisplaySettingsExW`, `SetThreadExecutionState`, WMI, and `psutil`—zero external display tools required.
+- **Live Battery Percentage Tray Badge**: Renders your exact battery percentage (e.g. `80`, `74`, `100`) directly on a crisp mode-colored panel/taskbar badge on both Linux and Windows, with a charging indicator while plugged in.
+- **Hardware 80% Battery Charge Limit**: Automatically discovers and enforces kernel EC charge-limit interfaces across Linux laptop vendors (`charge_control_end_threshold`, Uniwill/TongFang `charge_types=Long_Life`, Lenovo `conservation_mode`, LG/Samsung), with a once-per-charge-cycle 80% notification fallback on Windows and unsupported hardware. Runs independently of Smart Optimize `ON`/`OFF` and restores original firmware defaults on uninstall.
 - **4-Mode Workload Engine**: Smoothly switches between **Light**, **Download**, **Heavy**, and **Off** modes with 12-second downgrade hysteresis so bursty workloads never flap.
 - **Zero-Lag Light Mode**: Keeps CPU boost/turbo uncapped on Linux (`boost=1` / `no_turbo=0` and full `scaling_max_freq`) with `balance_power` EPP and `balanced` PPD—avoiding the sluggishness of `power-saver` profiles.
 - **Portable 3-Tier Adaptive Refresh Rate**: Automatically matches **AC / Charging (Max Hz)**, **Battery >= 20% (Smart Step-Down Mid Hz)**, and **Battery < 20% (60 Hz Battery Saver)** across any laptop panel on both Linux (KDE/wlroots/GNOME/X11) and Windows (`ChangeDisplaySettingsExW`).
 - **Pure Day/Night Circadian Screen Brightness**: Smooth 24-hour time-of-day brightness curve with battery scaling, smooth transitions, and automatic manual-override pause—**zero camera access and zero external sensor dependencies**.
 - **Deep Battery Optimization Tricks**: AMD Panel Power Savings (ABM), VM dirty writeback tuning, NMI watchdog disable, SATA/AHCI ALPM, PCIe ASPM, HD-Audio power save, HID-safe USB autosuspend, unused Ethernet/SD-card PCI runtime PM, optional keyboard backlight dimming, and Windows Wi-Fi/PCIe power saving.
 - **D3cold / RTD3 Safe**: Never runs `nvidia-smi` or reads `/proc/driver/nvidia/*`. GPU activity is inspected exclusively via kernel sysfs (`power/runtime_status`, `power_state`), and backlight control skips disconnected/dGPU entries.
-- **Battery Health Safe**: Never modifies OEM battery charge thresholds (`charge_control_*`, `conservation_mode`, etc.)—reports them read-only in status output.
-- **Cleanly Reversible**: Captures a portable hardware baseline before changing anything and restores every setting on uninstall.
+- **Cleanly Reversible**: Captures a portable hardware baseline (including original battery charge-limit mode) before changing anything and restores every setting on uninstall.
+
+---
+
+## Hardware 80% Battery Charge Limit & Tray Percentage Badge
+
+Lithium-ion laptop batteries degrade fastest when held at 100% while plugged in. `smart-powerd` protects battery longevity automatically while keeping live charge visibility right in your taskbar:
+
+- **Live Tray Battery Percentage Badge**: Both Linux (`smart-power-tray`) and Windows (`smart-powerd.exe`) draw the live battery percentage directly on the mode-colored tray icon (green = Light, blue = Download, amber = Heavy, gray = Off), with a subtle charging accent while plugged in.
+- **Independent Toggle**: Toggling Smart Optimize **OFF** restores full CPU/Wi-Fi/ASPM/refresh performance *without* disabling your 80% charge cap. Toggle the 80% cap independently anytime via the tray menu (**`80% Charge Limit: ON / OFF`**) or `smart-powerctl charge-limit on|off|toggle`.
+- **Automatic Hardware Backend Discovery (Linux)**:
+  1. **`BAT*/charge_control_end_threshold`** *(+ optional `charge_control_start_threshold`)* — ThinkPad, ASUS, Acer, Dell, Framework, MSI, System76, and standard ACPI battery drivers (`80` when ON, `100` when OFF).
+  2. **`BAT*/charge_stop_threshold`** *(+ optional `charge_start_threshold`)* — legacy ThinkPad / ACPI threshold drivers (`80` vs `100`).
+  3. **`BAT*/charge_types` (`Long_Life` / `Standard`)** — Uniwill / TongFang / Tuxedo / XMG laptops via mainline `uniwill_laptop` (`Long_Life` enforces the EC 80% stationary cap when ON; `Standard` when OFF).
+  4. **`/sys/bus/platform/drivers/ideapad_acpi/*/conservation_mode`** — Lenovo IdeaPad / Legion (`1` when ON, `0` when OFF).
+  5. **`/sys/devices/platform/lg-laptop/battery_care_limit`** (`80` vs `100`) & **`/sys/devices/platform/samsung/battery_life_extender`** (`1` vs `0`) — LG Gram & Samsung laptops.
+  6. **Alert-Only Fallback** *(Windows 10/11 & Linux laptops without a kernel EC cutoff)* — fires a single desktop tray notification per charge cycle as soon as charging reaches `stop_threshold` (default `80%`), resetting once unplugged or discharged below `stop_threshold - 2%`.
+- **Suspend/Resume Safe & Reversible**: Re-verifies EC state periodically (~15 s) in case suspend/resume resets firmware thresholds, and captures the pre-install value in `baseline.json` so `uninstall.sh` restores your laptop's original charge mode cleanly.
 
 ---
 
@@ -31,7 +49,7 @@
 | **Light** | Everyday browsing, editing, reading, idle | EPP `balance_power`, PPD `balanced`, boost uncapped | `Better Battery` overlay | Wi-Fi PS `on` / Medium PS, ASPM `powersave`, audio PS `5s`, USB/PCI PM, plus Linux Battery+Light tricks (ABM, dirty writeback, SATA ALPM, kbd dim) |
 | **Download** | Sustained RX >= `1.5 MiB/s`, RX spike >= `3.0 MiB/s`, or package manager / download tool active (`rclone mount` excluded) | EPP `balance_performance`, PPD `balanced` | `Balanced` overlay + `ES_SYSTEM_REQUIRED` sleep inhibit | Wi-Fi PS `off` / Max Perf (full throughput & low jitter), baseline PCIe/audio |
 | **Heavy** | Total CPU >= `25%`, single-core >= `85%`, active dGPU, compiler/IDE/game/encoder process, or fullscreen inhibitor | EPP `performance`, PPD `performance` | `Best Performance` overlay + `ABOVE_NORMAL` priority boost | All power-saving throttles disabled (baseline ASPM, Wi-Fi PS `off`, ABM `0`, audio PS baseline) |
-| **Off** | Manually toggled off via tray click or CLI | Restored to baseline (`balanced` / `balance_performance`) | Restored to `Balanced` + baseline Wi-Fi/PCIe | All baseline hardware values & max native refresh restored |
+| **Off** | Manually toggled off via tray click or CLI | Restored to baseline (`balanced` / `balance_performance`) | Restored to `Balanced` + baseline Wi-Fi/PCIe | All baseline hardware values & max native refresh restored (80% charge limit stays independent) |
 
 > **Hysteresis / Cooldown**: Stepping up from Light -> Download/Heavy is immediate. Stepping back down waits `cooldown_sec` (default `12.0s`) after the workload subsides to prevent rapid mode oscillation during compilation stages or video buffering.
 >
@@ -85,6 +103,7 @@ Every optimization is toggleable in `config.toml` and restores its captured base
 
 | Optimization | Platform | Applied In | Behavior | Restored On |
 | :--- | :--- | :--- | :--- | :--- |
+| **80% Hardware Charge Limit** | Linux + Windows | Independent (Always when enabled) | Enforces kernel EC cutoff (`charge_control_end_threshold`, `charge_types=Long_Life`, `conservation_mode`, LG/Samsung) or 80% charging alert on Windows/alert-only | Charge-limit OFF (`100%` / `Standard`) or Uninstall (baseline) |
 | **3-Tier Adaptive Refresh Rate** | Linux + Windows | Battery >= 20% (`mid`), < 20% (`low`) | Steps down built-in `eDP`/`LVDS` panel (`kscreen-doctor`, `wlr-randr`, `gdctl`/`gnome-randr`, `xrandr`, Win32 `ChangeDisplaySettingsExW`) | AC, Off, or tray exit |
 | **AMD Panel Power Savings (ABM)** | Linux | Battery + Light | Sets `/sys/class/drm/card*-eDP-*/amdgpu/panel_power_savings` to `amd_abm_battery_level` (default `2`) | AC, Heavy, Off, Uninstall (`0` / baseline) |
 | **VM Dirty Writeback** | Linux | Battery + Light | Raises `/proc/sys/vm/dirty_writeback_centisecs` to `1500` (15 s) to batch disk flushes | AC, Heavy, Off, Uninstall |
@@ -97,7 +116,6 @@ Every optimization is toggleable in `config.toml` and restores its captured base
 | **Unused PCI Runtime PM** | Linux | Light | Auto-discovers Ethernet (`0x0200`, link down only) and SD card readers (`0x0805`). Never touches Wi-Fi, NVMe, or active GPUs | Download, Heavy, Off, Uninstall |
 | **Keyboard Backlight Dim** | Linux | Battery + Light | Auto-discovers `/sys/class/leds/*kbd_backlight*`, saves current level, and dims to `0` | AC, Heavy, Off, Uninstall |
 | **RTD3 / D3cold Protection** | Linux | Always | Reads only sysfs `power/runtime_status` and `power_state` for detected NVIDIA/AMD dGPUs — zero GPU wakeups | N/A |
-| **Battery Charge Thresholds** | Linux | Always | Strictly read-only — preserves BIOS/OEM charge limits (`charge_control_end_threshold`, `conservation_mode`, etc.) | Never modified |
 
 ---
 
@@ -105,13 +123,13 @@ Every optimization is toggleable in `config.toml` and restores its captured base
 
 ### Operating Systems & Desktop Environments
 
-| Platform / Environment | Power Engine | Tray UI | Circadian Brightness | 3-Tier Refresh Rate |
-| :--- | :--- | :--- | :--- | :--- |
-| **Linux — KDE Plasma 6 (Wayland)** | `smart-powerd` (systemd) | PyQt6 SNI | Native silent D-Bus (`Solid.PowerManagement`) | Native (`kscreen-doctor`) |
-| **Linux — GNOME (Wayland)** | `smart-powerd` (systemd) | PyQt6 (AppIndicator) | `brightnessctl` / sysfs | `gdctl` / `gnome-randr` |
-| **Linux — Hyprland / Sway / wlroots** | `smart-powerd` (systemd) | PyQt6 SNI | `brightnessctl` / sysfs | `wlr-randr` |
-| **Linux — X11 (XFCE, i3, Cinnamon, MATE)** | `smart-powerd` (systemd) | PyQt6 | `brightnessctl` / sysfs | `xrandr` |
-| **Windows 10 / 11 (x64)** | Standalone `smart-powerd.exe` or Python | PyQt6 (tray) | WMI `WmiMonitorBrightness` | Native Win32 `ChangeDisplaySettingsExW` |
+| Platform / Environment | Power Engine | Tray UI (with Battery %) | Charge Limit | Circadian Brightness | 3-Tier Refresh Rate |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Linux — KDE Plasma 6 (Wayland)** | `smart-powerd` (systemd) | PyQt6 SNI badge | Hardware EC / Alert | Native silent D-Bus (`Solid.PowerManagement`) | Native (`kscreen-doctor`) |
+| **Linux — GNOME (Wayland)** | `smart-powerd` (systemd) | PyQt6 (AppIndicator) | Hardware EC / Alert | `brightnessctl` / sysfs | `gdctl` / `gnome-randr` |
+| **Linux — Hyprland / Sway / wlroots** | `smart-powerd` (systemd) | PyQt6 SNI badge | Hardware EC / Alert | `brightnessctl` / sysfs | `wlr-randr` |
+| **Linux — X11 (XFCE, i3, Cinnamon, MATE)** | `smart-powerd` (systemd) | PyQt6 badge | Hardware EC / Alert | `brightnessctl` / sysfs | `xrandr` |
+| **Windows 10 / 11 (x64)** | Standalone `smart-powerd.exe` or Python | PyQt6 badge | 80% Charging Alert | WMI `WmiMonitorBrightness` | Native Win32 `ChangeDisplaySettingsExW` |
 
 ### CPUs, GPUs & Linux Distributions
 
@@ -172,8 +190,8 @@ Tagged releases on [GitHub Releases](https://github.com/MMustafaAydemir/smart-po
 
 From a release tarball:
 ```bash
-tar -xzf smart-powerd-v2.2.0-linux.tar.gz
-cd smart-powerd-v2.2.0-linux
+tar -xzf smart-powerd-v2.3.0-linux.tar.gz
+cd smart-powerd-v2.3.0-linux
 sudo ./install.sh
 ```
 
@@ -205,8 +223,8 @@ On subsequent logins, `smart-power-tray` starts automatically via `~/.config/aut
 
 ### Option A — Standalone Executable (Recommended, Zero Python Required)
 
-1. Download **`smart-powerd-v2.2.0-windows.exe`** from [GitHub Releases](https://github.com/MMustafaAydemir/smart-powerd/releases) and double-click it to run directly in the system tray — **or**
-2. Download and extract **`smart-powerd-v2.2.0-windows.zip`** and run the PowerShell installer to register logon autostart:
+1. Download **`smart-powerd-v2.3.0-windows.exe`** from [GitHub Releases](https://github.com/MMustafaAydemir/smart-powerd/releases) and double-click it to run directly in the system tray — **or**
+2. Download and extract **`smart-powerd-v2.3.0-windows.zip`** and run the PowerShell installer to register logon autostart:
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
    ```
@@ -230,9 +248,11 @@ powershell -ExecutionPolicy Bypass -File .\windows\build-exe.ps1
 ### Windows Tray & CLI Usage
 
 - **System Tray**:
-  - **Left-Click**: Toggle Smart Optimize ON / OFF (green Light, blue Download, amber Heavy, gray Off).
-  - **Hover Tooltip**: Mode, Battery % / Wattage, Power Overlay, Wi-Fi PS, live Refresh Rate Hz + tier, and Circadian Brightness %.
-  - **Right-Click Menu**: Toggle Smart Optimize, Auto Brightness (Day/Night Schedule), Open Config, Quit (restores native max Hz).
+  - **Tray Icon**: Live battery percentage badge colored by active mode (green Light, blue Download, amber Heavy, gray Off) with charging accent.
+  - **Left-Click**: Toggle Smart Optimize ON / OFF.
+  - **Hover Tooltip**: Mode, Battery % / Wattage, 80% Charge Limit status, Power Overlay, Wi-Fi PS, live Refresh Rate Hz + tier, and Circadian Brightness %.
+  - **Right-Click Menu**: Toggle Smart Optimize, `80% Charge Limit: ON / OFF`, Auto Brightness (Day/Night Schedule), Open Config, Quit (restores native max Hz).
+  - **80% Charging Alert**: Fires a native Windows toast notification once per charge cycle when charging reaches 80%.
 - **CLI** (when installed from source or invoking the binary):
   ```powershell
   python "$env:LOCALAPPDATA\smart-powerd\smart_power_win.py" --status
@@ -264,10 +284,11 @@ Key sections in `config.toml`:
 - `[general]` — `poll_interval_sec`, `cooldown_sec`, `wifi_recheck_ticks`
 - `[cpu]` — `light_epp_ac`, `light_epp_battery`, `download_epp`, `heavy_epp`, `uncap_boost_in_light`
 - `[battery_tricks]` — `aspm_light`, `audio_power_save_light`, `dirty_writeback_battery`, `disable_nmi_watchdog`, `sata_alpm_light`, `amd_abm_battery_level`, `usb_autosuspend_non_hid`, `pci_runtime_pm_unused`, `kbd_backlight_dim_battery`, `refresh_policy_enabled`, `ac_refresh_hz`, `battery_refresh_hz`, `low_battery_refresh_pct`, `low_refresh_hz`
+- `[battery_charge]` — `limit_enabled`, `stop_threshold`, `start_threshold`, `notify_when_no_hw_limit`
 - `[brightness]` — `enabled`, `battery_multiplier`, `min_pct`, `max_pct`, `smooth_step_pct`, `manual_override_pause_sec`, `schedule`
 - `[workloads]` — `extra_heavy_processes`, `extra_download_processes`, `rx_threshold_mib_s`, `rx_immediate_mib_s`, `cpu_heavy_pct`, `single_core_heavy_pct`, `heavy_nice`
 
-Runtime toggle overrides made from the tray or CLI (`enabled`, `brightness_enabled`) are persisted separately in `state.json` so your `config.toml` is never rewritten behind your back.
+Runtime toggle overrides made from the tray or CLI (`enabled`, `brightness_enabled`, `charge_limit_enabled`) are persisted separately in `state.json` so your `config.toml` is never rewritten behind your back.
 
 ---
 
@@ -276,23 +297,28 @@ Runtime toggle overrides made from the tray or CLI (`enabled`, `brightness_enabl
 ### CLI (`smart-powerctl`)
 
 ```bash
-smart-powerctl status              # Human-readable telemetry (mode, wattage, CPU, GPU, Wi-Fi, brightness, refresh)
-smart-powerctl status --json       # Machine-readable JSON telemetry
-smart-powerctl on                  # Enable adaptive optimization
-smart-powerctl off                 # Pause optimization and restore baseline hardware settings
-smart-powerctl toggle              # Toggle optimization ON / OFF
-smart-powerctl reload              # Hot-reload /etc/smart-powerd/config.toml
-smart-powerctl brightness on       # Enable day/night circadian brightness
-smart-powerctl brightness off      # Disable day/night circadian brightness
-smart-powerctl brightness toggle   # Toggle day/night circadian brightness
+smart-powerctl status                 # Human-readable telemetry (mode, wattage, battery %, charge limit, CPU, GPU, Wi-Fi, brightness, refresh)
+smart-powerctl status --json          # Machine-readable JSON telemetry
+smart-powerctl on                     # Enable adaptive optimization
+smart-powerctl off                    # Pause optimization (restores CPU/Wi-Fi/ASPM/Hz; keeps 80% charge limit independent)
+smart-powerctl toggle                 # Toggle optimization ON / OFF
+smart-powerctl reload                 # Hot-reload /etc/smart-powerd/config.toml
+smart-powerctl brightness on          # Enable day/night circadian brightness
+smart-powerctl brightness off         # Disable day/night circadian brightness
+smart-powerctl brightness toggle      # Toggle day/night circadian brightness
+smart-powerctl charge-limit on        # Enforce 80% hardware battery charge limit
+smart-powerctl charge-limit off       # Allow full 100% charging (Standard mode)
+smart-powerctl charge-limit toggle    # Toggle 80% battery charge limit ON / OFF
 ```
 
 ### System Tray (`smart-power-tray`)
 
+- **Tray Icon**: Live battery percentage badge colored by active mode (green Light, blue Download, amber Heavy, gray Off) with charging accent.
 - **Left-Click**: Instant one-click toggle of Smart Optimize ON / OFF (passwordless via allowlisted `sudoers`).
-- **Hover Tooltip**: Live mode, trigger reason, battery percentage & discharge wattage, CPU EPP, Wi-Fi power save, dGPU status, panel refresh rate & tier (`AC` / `Battery` / `Low Battery`), and circadian brightness level/status.
+- **Hover Tooltip**: Live mode, trigger reason, battery percentage & discharge/charge wattage, 80% charge limit status (`ON — Long_Life` / `80%` / `OFF`), CPU EPP, Wi-Fi power save, dGPU status, panel refresh rate & tier (`AC` / `Battery` / `Low Battery`), and circadian brightness level/status.
 - **Right-Click Menu**:
   - `Turn Smart Optimize OFF / ON`
+  - `80% Charge Limit: ON / OFF`
   - `Auto Brightness: ON / OFF`
   - `Refresh Status`
   - `Quit Tray` (automatically restores native max panel refresh rate before exiting)
@@ -307,11 +333,11 @@ smart-powerctl brightness toggle   # Toggle day/night circadian brightness
 ├── adaptive_brightness.py         # Pure day/night circadian brightness controller
 └── display_refresh.py             # Cross-platform 3-tier refresh controller (KDE/wlroots/GNOME/X11/Win32)
 
-/usr/local/sbin/smart-powerd           # Root systemd daemon (reads sysfs, applies power tuning)
+/usr/local/sbin/smart-powerd           # Root systemd daemon (reads sysfs, applies power & charge-limit tuning)
 /usr/local/sbin/smart-power-uninstall  # Clean reversible uninstaller
 /usr/local/libexec/smart-powerd-helper # Strictly allowlisted privilege helper (no shell calls)
 /usr/local/bin/smart-powerctl          # User CLI client
-/usr/local/bin/smart-power-tray        # PyQt6 desktop tray (hosts brightness + refresh rate)
+/usr/local/bin/smart-power-tray        # PyQt6 desktop tray (battery % badge + brightness + refresh rate)
 
 /etc/smart-powerd/config.toml          # User configuration (preserved across upgrades)
 /etc/systemd/system/smart-powerd.service
@@ -323,7 +349,7 @@ smart-powerctl brightness toggle   # Toggle day/night circadian brightness
 
 ### Security Model (Linux)
 
-`/etc/sudoers.d/smart-powerd` grants detected admin groups (`%wheel` and/or `%sudo`) passwordless execution **only** for `/usr/local/libexec/smart-powerd-helper` with the exact 7 literal subcommands (`on`, `off`, `toggle`, `reload`, `brightness-on`, `brightness-off`, `brightness-toggle`). No arbitrary arguments or shell execution are permitted.
+`/etc/sudoers.d/smart-powerd` grants detected admin groups (`%wheel` and/or `%sudo`) passwordless execution **only** for `/usr/local/libexec/smart-powerd-helper` with the exact 10 literal subcommands (`on`, `off`, `toggle`, `reload`, `brightness-on`, `brightness-off`, `brightness-toggle`, `charge-limit-on`, `charge-limit-off`, `charge-limit-toggle`). No arbitrary arguments or shell execution are permitted.
 
 ---
 
@@ -338,7 +364,7 @@ python3 -m unittest discover -s tests -v
 Build Linux + Windows release archives locally:
 
 ```bash
-./scripts/build-release.sh v2.2.0
+./scripts/build-release.sh v2.3.0
 (cd dist && sha256sum -c SHA256SUMS.txt)
 ```
 
@@ -359,9 +385,9 @@ sudo smart-power-uninstall --purge
 What Linux uninstall does:
 1. Stops `smart-power-tray` gracefully (restoring native max refresh rate) and removes autostart & desktop files.
 2. Disables and stops `smart-powerd.service`.
-3. Restores **all** baseline hardware settings from `/var/lib/smart-powerd/baseline.json` (PPD `balanced`, CPU boost=1 / `no_turbo=0`, uncapped `scaling_max_freq`, EPP `balance_performance` or `schedutil`/`ondemand`/`powersave` governor, PCIe ASPM, HD-Audio power save, Wi-Fi power save, VM dirty writeback, NMI watchdog, SATA ALPM, AMD ABM, keyboard backlight, PCI runtime PM, and USB autosuspend).
+3. Restores **all** baseline hardware settings from `/var/lib/smart-powerd/baseline.json` (PPD `balanced`, CPU boost=1 / `no_turbo=0`, uncapped `scaling_max_freq`, EPP `balance_performance` or `schedutil`/`ondemand`/`powersave` governor, PCIe ASPM, HD-Audio power save, Wi-Fi power save, VM dirty writeback, NMI watchdog, SATA ALPM, AMD ABM, keyboard backlight, PCI runtime PM, USB autosuspend, and original battery charge-limit setting).
 4. Removes all installed binaries, libraries, systemd unit, `sudoers.d` rule, optional `ananicy.d` rules, `/run/smart-powerd`, and `/var/lib/smart-powerd`.
-5. **Never touches** battery charge thresholds or desktop environment power settings.
+5. **Never touches** desktop environment power settings.
 
 ---
 

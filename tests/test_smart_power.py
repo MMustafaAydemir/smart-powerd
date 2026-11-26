@@ -161,6 +161,45 @@ extra_heavy_processes = ["my_solver", "sim_runner"]
         )
         self.assertFalse(eff_override["enabled"])
 
+    def test_effective_charge_limit_config_clamping_and_overrides(self) -> None:
+        # Default schema keys & values
+        self.assertEqual(
+            spc.DEFAULT_CONFIG["battery_charge"],
+            {
+                "limit_enabled": True,
+                "stop_threshold": 80,
+                "start_threshold": 75,
+                "notify_when_no_hw_limit": True,
+            },
+        )
+        # Defer to config.toml when state value is None
+        eff_default = spc.effective_charge_limit_config(
+            spc.DEFAULT_CONFIG, {"enabled": True, "charge_limit_enabled": None}
+        )
+        self.assertTrue(eff_default["limit_enabled"])
+        self.assertEqual(eff_default["stop_threshold"], 80)
+        self.assertEqual(eff_default["start_threshold"], 75)
+        self.assertTrue(eff_default["notify_when_no_hw_limit"])
+
+        # State bool override takes precedence
+        eff_off = spc.effective_charge_limit_config(
+            spc.DEFAULT_CONFIG, {"enabled": True, "charge_limit_enabled": False}
+        )
+        self.assertFalse(eff_off["limit_enabled"])
+
+        # Threshold clamping: stop in 50..100, start in 40..95 and <= stop - 5
+        clamped_low = spc.effective_charge_limit_config(
+            {"battery_charge": {"stop_threshold": 30, "start_threshold": 90}}
+        )
+        self.assertEqual(clamped_low["stop_threshold"], 50)
+        self.assertEqual(clamped_low["start_threshold"], 45)
+
+        clamped_high = spc.effective_charge_limit_config(
+            {"battery_charge": {"stop_threshold": 150, "start_threshold": 99}}
+        )
+        self.assertEqual(clamped_high["stop_threshold"], 100)
+        self.assertEqual(clamped_high["start_threshold"], 95)
+
     def test_legacy_removed_brightness_keys_ignored_cleanly(self) -> None:
         legacy_toml = """
 [brightness]
@@ -949,6 +988,87 @@ class TestSmartPowerDaemon(unittest.TestCase):
             d._set_cpu_performance("download", "balance_performance")
             self.assertEqual(smart_powerd.read_text(epp_path), "balance_performance")
 
+    def test_charge_limit_backends_discovery_and_enforcement(self) -> None:
+        # 1. charge_control_end_threshold (+ optional start threshold)
+        with tempfile.TemporaryDirectory() as tmp:
+            bat = Path(tmp) / "BAT0"
+            bat.mkdir()
+            end_p = bat / "charge_control_end_threshold"
+            start_p = bat / "charge_control_start_threshold"
+            end_p.write_text("100\n", encoding="utf-8")
+            start_p.write_text("0\n", encoding="utf-8")
+
+            be = smart_powerd.discover_charge_limit_backend(
+                bat, ideapad_paths=[], lg_path=None, samsung_path=None
+            )
+            self.assertTrue(be.hw_supported)
+            self.assertEqual(be.backend, "charge_control_end_threshold")
+            self.assertEqual(be.path, end_p)
+            self.assertEqual(be.start_path, start_p)
+
+            base = smart_powerd.capture_charge_limit_baseline(be)
+            self.assertEqual(base["value"], "100")
+            self.assertEqual(base["start_value"], "0")
+
+            self.assertTrue(smart_powerd.apply_charge_limit(be, True, 80, 75, base))
+            self.assertEqual(smart_powerd.read_text(end_p), "80")
+            self.assertEqual(smart_powerd.read_text(start_p), "75")
+            self.assertEqual(smart_powerd.read_charge_limit_active_value(be), "80%")
+
+            self.assertTrue(smart_powerd.apply_charge_limit(be, False, 80, 75, base))
+            self.assertEqual(smart_powerd.read_text(end_p), "100")
+            self.assertEqual(smart_powerd.read_text(start_p), "0")
+
+        # 2. Uniwill/TongFang charge_types ([Trickle] Standard Long_Life)
+        with tempfile.TemporaryDirectory() as tmp:
+            bat = Path(tmp) / "BAT0"
+            bat.mkdir()
+            ct_p = bat / "charge_types"
+            ct_p.write_text("[Trickle] Standard Long_Life\n", encoding="utf-8")
+
+            be = smart_powerd.discover_charge_limit_backend(
+                bat, ideapad_paths=[], lg_path=None, samsung_path=None
+            )
+            self.assertTrue(be.hw_supported)
+            self.assertEqual(be.backend, "charge_types")
+            base = smart_powerd.capture_charge_limit_baseline(be)
+            self.assertEqual(base["value"], "Trickle")
+
+            self.assertTrue(smart_powerd.apply_charge_limit(be, True, 80, 75, base))
+            self.assertEqual(smart_powerd.read_text(ct_p), "Long_Life")
+
+            self.assertTrue(smart_powerd.apply_charge_limit(be, False, 80, 75, base))
+            self.assertEqual(smart_powerd.read_text(ct_p), "Standard")
+
+        # 3. Lenovo ideapad_acpi conservation_mode
+        with tempfile.TemporaryDirectory() as tmp:
+            bat = Path(tmp) / "BAT0"
+            bat.mkdir()
+            cm_p = Path(tmp) / "conservation_mode"
+            cm_p.write_text("0\n", encoding="utf-8")
+
+            be = smart_powerd.discover_charge_limit_backend(
+                bat, ideapad_paths=[cm_p], lg_path=None, samsung_path=None
+            )
+            self.assertTrue(be.hw_supported)
+            self.assertEqual(be.backend, "conservation_mode")
+            self.assertTrue(smart_powerd.apply_charge_limit(be, True, 80, 75))
+            self.assertEqual(smart_powerd.read_text(cm_p), "1")
+            self.assertTrue(smart_powerd.apply_charge_limit(be, False, 80, 75))
+            self.assertEqual(smart_powerd.read_text(cm_p), "0")
+
+        # 4. alert-only fallback when no writable sysfs backend exists
+        with tempfile.TemporaryDirectory() as tmp:
+            bat = Path(tmp) / "BAT0"
+            bat.mkdir()
+            be = smart_powerd.discover_charge_limit_backend(
+                bat, ideapad_paths=[], lg_path=None, samsung_path=None
+            )
+            self.assertFalse(be.hw_supported)
+            self.assertEqual(be.backend, "alert-only")
+            self.assertIsNone(smart_powerd.capture_charge_limit_baseline(be))
+            self.assertFalse(smart_powerd.apply_charge_limit(be, True, 80, 75))
+
 
 class TestCrossWorkerContracts(unittest.TestCase):
     """Integration-contract checks across helper, ctl, daemon, sudoers, and install.sh."""
@@ -965,6 +1085,9 @@ class TestCrossWorkerContracts(unittest.TestCase):
                 "brightness-on",
                 "brightness-off",
                 "brightness-toggle",
+                "charge-limit-on",
+                "charge-limit-off",
+                "charge-limit-toggle",
             },
         )
 
@@ -979,6 +1102,10 @@ class TestCrossWorkerContracts(unittest.TestCase):
             self.assertEqual(
                 smart_powerctl.resolve_control_command(["brightness", sub]),
                 f"brightness-{sub}",
+            )
+            self.assertEqual(
+                smart_powerctl.resolve_control_command(["charge-limit", sub]),
+                f"charge-limit-{sub}",
             )
         # Removed camera commands & arbitrary flags must be rejected
         self.assertIsNone(smart_powerctl.resolve_control_command(["--arbitrary-flag"]))
@@ -1000,13 +1127,15 @@ class TestCrossWorkerContracts(unittest.TestCase):
         install_cmds = set(match.group(1).split())
         self.assertEqual(install_cmds, expected)
 
-        # 5. smart-powerd.py handle_command accepts all 7 and rejects unknown/removed
+        # 5. smart-powerd.py handle_command accepts all 10 and rejects unknown/removed
         d = smart_powerd.SmartPowerDaemon.__new__(smart_powerd.SmartPowerDaemon)
         d.enabled = True
         d.current_mode = "light"
         d.current_reason = "idle"
         d.config = copy.deepcopy(spc.DEFAULT_CONFIG)
-        d.state = {"enabled": True, "brightness_enabled": None}
+        d.state = {"enabled": True, "brightness_enabled": None, "charge_limit_enabled": None}
+        d.baseline = {}
+        d.charge_limit_backend = smart_powerd.ChargeLimitBackend("alert-only")
         d.last_mode_activity_ts = {}
         d.last_download_pids = []
         d.last_heavy_pids = []
@@ -1026,6 +1155,12 @@ class TestCrossWorkerContracts(unittest.TestCase):
         for cmd in sorted(expected):
             resp = d.handle_command(cmd)
             self.assertTrue(resp.get("ok"), f"Daemon rejected valid command '{cmd}': {resp}")
+
+        # Verify turning Smart Optimize OFF keeps charge_limit_enabled independent
+        d.handle_command("charge-limit-on")
+        d.handle_command("off")
+        self.assertFalse(d.enabled)
+        self.assertTrue(d.state["charge_limit_enabled"])
 
         for bad_cmd in ("rm -rf /", "webcam-als-on", "webcam-als-toggle", "measure-light"):
             bad_resp = d.handle_command(bad_cmd)
@@ -1081,19 +1216,6 @@ class TestCrossWorkerContracts(unittest.TestCase):
         ):
             src = py_file.read_text(encoding="utf-8")
             ast.parse(src, filename=str(py_file))
-
-    def test_no_charge_threshold_writes_in_codebase(self) -> None:
-        write_re = re.compile(
-            r"(write_text|write_bytes|open\([^)]*['\"]w).*(charge_control|charge_start|charge_stop|charge_behaviour|conservation_mode)",
-            re.IGNORECASE,
-        )
-        for path in sorted(REPO_ROOT.iterdir()):
-            if path.suffix in {".py", ".sh"}:
-                txt = path.read_text(encoding="utf-8", errors="ignore")
-                self.assertIsNone(
-                    write_re.search(txt),
-                    f"Forbidden write to battery charge threshold found in {path.name}",
-                )
 
 
 if __name__ == "__main__":

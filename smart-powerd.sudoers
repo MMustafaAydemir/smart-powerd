@@ -8,4 +8,7 @@
     /usr/local/libexec/smart-powerd-helper reload, \
     /usr/local/libexec/smart-powerd-helper brightness-on, \
     /usr/local/libexec/smart-powerd-helper brightness-off, \
-    /usr/local/libexec/smart-powerd-helper brightness-toggle
+    /usr/local/libexec/smart-powerd-helper brightness-toggle, \
+    /usr/local/libexec/smart-powerd-helper charge-limit-on, \
+    /usr/local/libexec/smart-powerd-helper charge-limit-off, \
+    /usr/local/libexec/smart-powerd-helper charge-limit-toggle

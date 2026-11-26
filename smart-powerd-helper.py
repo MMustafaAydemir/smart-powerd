@@ -33,6 +33,9 @@ VALID_COMMANDS: frozenset[str] = frozenset(
         "brightness-on",
         "brightness-off",
         "brightness-toggle",
+        "charge-limit-on",
+        "charge-limit-off",
+        "charge-limit-toggle",
     }
 )
 
